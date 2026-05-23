@@ -6,6 +6,12 @@
 
 struct llama_vocab;
 struct llama_grammar;
+struct ggml_backend_buffer_type;
+
+// check if all ggml ops used by the sampler are supported by the backend
+bool llama_sampler_backend_support(
+        llama_sampler              * smpl,
+        ggml_backend_buffer_type_t   buft);
 
 // sampler chain
 

@@ -569,6 +569,10 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // buffer type for backend sampling
+    // for tensor split mode, this is a single-GPU buft (not the meta buft)
+    ggml_backend_buffer_type_t sampler_buft = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -632,7 +636,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            sampler_buft == other.sampler_buft;
     }
 };
 
@@ -768,6 +773,9 @@ struct llm_graph_context {
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
+
+    // buffer type for backend sampling (single-GPU buft for tensor split mode)
+    ggml_backend_buffer_type_t sampler_buft = nullptr;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;

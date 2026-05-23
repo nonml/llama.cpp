@@ -398,6 +398,15 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    // check if a device is a meta device:
+    GGML_API bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev);
+
+    // get the number of simple devices in a meta device:
+    GGML_API size_t ggml_backend_meta_dev_n_devs(ggml_backend_dev_t meta_dev);
+
+    // get the i-th simple device from a meta device:
+    GGML_API ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t meta_dev, size_t i);
+
     //
     // Utils
     //

@@ -556,7 +556,7 @@ private:
 };
 
 // check if all ggml ops used by the sampler are supported by the backend
-static bool llama_sampler_backend_support(
+bool llama_sampler_backend_support(
         llama_sampler              * smpl,
         ggml_backend_buffer_type_t   buft) {
     auto * device = ggml_backend_buft_get_device(buft);
@@ -749,7 +749,16 @@ static void llama_sampler_chain_backend_apply(
           struct llama_sampler_data * data) {
     auto * chain = (llama_sampler_chain *) smpl->ctx;
 
-    GGML_ASSERT(chain->is_init && "llama_sampler_chain_backend_init() not called");
+    // When not initialized (e.g., during llama_sampler_backend_support check),
+    // build graph for all samplers in the chain
+    if (!chain->is_init) {
+        for (auto & smpl : chain->samplers) {
+            if (smpl.ptr->iface->backend_apply) {
+                smpl.ptr->iface->backend_apply(smpl.ptr, ctx, gf, data);
+            }
+        }
+        return;
+    }
 
     for (auto & smpl : chain->samplers) {
         if (!smpl.is_backend) {

@@ -82,8 +82,6 @@ struct ggml_backend_meta_device_context {
     }
 };
 
-static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev);
-
 static const char * ggml_backend_meta_device_get_name(ggml_backend_dev_t dev) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
@@ -193,17 +191,17 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .event_synchronize    = */ nullptr,
 };
 
-static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
+bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
     return dev != nullptr && dev->iface.get_name == ggml_backend_meta_device_iface.get_name;
 }
 
-static size_t ggml_backend_meta_dev_n_devs(ggml_backend_dev_t meta_dev) {
+size_t ggml_backend_meta_dev_n_devs(ggml_backend_dev_t meta_dev) {
     GGML_ASSERT(ggml_backend_dev_is_meta(meta_dev));
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
     return meta_dev_ctx->simple_devs.size();
 }
 
-static ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t meta_dev, size_t index) {
+ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t meta_dev, size_t index) {
     GGML_ASSERT(ggml_backend_dev_is_meta(meta_dev));
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
     GGML_ASSERT(index < meta_dev_ctx->simple_devs.size());
@@ -524,18 +522,81 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             }
         }
         if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
-            ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
+            // Op with no data sources (e.g. ARANGE) — output is identical on all GPUs.
+            ret = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
         }
         if (scalar_only && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
-            ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
+            // Scalar-only op receiving a split input (e.g. SUM on axis-1 split logits).
+            // Fall back to MIRRORED so the op runs on every segment independently.
+            // This is correct for sampling ops that produce per-token scalars.
+            ret = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
         }
-        GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+        if (ret.axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+            GGML_LOG_WARN("ggml-backend-meta: %s op reached sched_reserve with UNKNOWN "
+                          "source split state — falling back to MIRRORED execution on "
+                          "all segments (tensor: %s)\n",
+                          ggml_op_name(tensor->op), tensor->name);
+            ret = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+        }
+        return ret;
+    };
+
+    // Propagate split state for element-wise ops where one operand may broadcast.
+    // If one operand is split and the other is MIRRORED/NONE and can repeat along the split axis,
+    // the output inherits the split from the non-broadcast operand.
+    auto handle_elementwise = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, 1};
+        for (size_t i = 0; i < GGML_MAX_SRC; i++) {
+            if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
+                continue;
+            }
+            if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
+                ret = src_ss[i];
+            } else if (split_states_equal(src_ss[i], ret)) {
+                // Both operands have the same split state — output inherits it.
+                continue;
+            } else if (ret.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[i].axis >= 0 && src_ss[i].axis < GGML_MAX_DIMS) {
+                // Current result is MIRRORED, new operand is split — output inherits the split.
+                ret = src_ss[i];
+            } else if (src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
+                // Current result is split, new operand is MIRRORED — verify it can repeat.
+                if (ggml_can_repeat(tensor->src[i], tensor)) {
+                    continue; // MIRRORED operand broadcasts, output stays split.
+                }
+                ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
+                break;
+            } else {
+                ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
+                break;
+            }
+        }
+        if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
+            // Op with no data sources (e.g. ARANGE) — output is identical on all GPUs.
+            ret = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+        }
+        if (ret.axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+            GGML_LOG_WARN("ggml-backend-meta: %s op reached sched_reserve with UNKNOWN "
+                          "source split state — falling back to MIRRORED execution on "
+                          "all segments (tensor: %s)\n",
+                          ggml_op_name(tensor->op), tensor->name);
+            ret = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+        }
         return ret;
     };
 
     // Some ops process data on a per-row bases:
     auto handle_per_row = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0);
+        // Per-row ops (argsort, top-k, argmax, norm) work on each row independently.
+        // For axis-0 split inputs, each GPU processes its row subset.
+        // For axis-1 split inputs, each GPU processes all rows on its column subset.
+        // MIRRORED inputs are processed identically on all GPUs.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+            GGML_LOG_WARN("ggml-backend-meta: %s op reached sched_reserve with UNKNOWN "
+                          "source split state — falling back to MIRRORED execution on "
+                          "all segments (tensor: %s)\n",
+                          ggml_op_name(tensor->op), tensor->name);
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+        }
         return src_ss[0];
     };
 
@@ -549,8 +610,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
            (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL)))) {
             return src_ss[0]; // GGML_OP_ADD_ID
         }
-        GGML_ASSERT(tensor->src[2] == nullptr || src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-        return handle_generic(src_ss, /*scalar_only =*/ false);
+        if (tensor->src[2] != nullptr && src_ss[2].axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            GGML_LOG_WARN("ggml-backend-meta: binary op src[2] is not MIRRORED — falling back to MIRRORED (tensor: %s)\n", tensor->name);
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+        }
+        // Use elementwise propagation to handle AXIS + MIRRORED broadcasting.
+        return handle_elementwise(src_ss);
     };
 
     auto handle_concat = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
@@ -573,6 +638,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
         }
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2 || src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_3)) {
+            ggml_backend_meta_split_state ret = src_ss[1];
+            ret.n_segments = 1;
+            return ret;
+        }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             ggml_backend_meta_split_state ret = src_ss[0];
             ret.axis = GGML_BACKEND_SPLIT_AXIS_0;
@@ -587,6 +658,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0) {
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, 1};
+        }
+        // Both inputs split along axis 1: output is axis-1 split.
+        // E.g., output layer: token_embd [n_embd, n_tokens] split axis 1 (tokens)
+        // + output.weight [n_vocab, n_embd] split axis 1 (n_embd)
+        // -> logits [n_vocab, n_tokens] split axis 1 (tokens)
+        // Each GPU has full vocab for its token subset.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1) {
+            ggml_backend_meta_split_state ret = src_ss[0];
+            ret.n_segments = 1;
+            return ret;
         }
         GGML_ABORT("fatal error");
         //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
@@ -735,35 +816,69 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
         }
+        // GET_ROWS with src[0] split on axis 1 (e.g. vocab) and src[1] split on axis 0 (e.g. batch).
+        // Used by top_k sampler: each GPU selects rows from its vocab slice using its batch indices.
+        // Result is split on axis 1 (same as src[0]).
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            return src_ss[0];
+        }
+        // GET_ROWS with src[0] split on axis 1 (e.g. logits) and src[1] MIRRORED (e.g. scalar index).
+        // Each GPU selects rows from its token subset independently. The output is a scalar
+        // or small tensor per GPU that doesn't have the same split structure as the source.
+        // Return MIRRORED so each GPU runs independently.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+        }
+        // Both inputs MIRRORED: result is MIRRORED (MTP shared head).
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+        }
         return handle_generic(src_ss, /*scalar_only =*/ true);
     };
 
     auto handle_set_rows = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_1);
-        GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-        GGML_ASSERT(split_states_equal(src_ss[0], src_ss[2]));
+        // SET_ROWS sets specific rows of src[0] (data) based on src[1] (indices) and src[2] (mask).
+        // The output inherits the data's split state — the indices/mask just select which rows to modify.
+        // Mixed split states are valid: e.g. AXIS-1 data + MIRRORED indices + AXIS-1 mask in sampling ops.
+        if (src_ss[1].axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            GGML_LOG_WARN("ggml-backend-meta: SET_ROWS src[1] (indices) is not MIRRORED (axis=%d) — falling back to MIRRORED (tensor: %s)\n", src_ss[1].axis, tensor->name);
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+        }
+        // Output inherits data's split state, regardless of mask's split state.
         return src_ss[0];
     };
 
     auto handle_rope = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        if (src_ss[1].axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            GGML_LOG_WARN("ggml-backend-meta: ROPE src[1] (params) is not MIRRORED (axis=%d) — falling back to MIRRORED (tensor: %s)\n", src_ss[1].axis, tensor->name);
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+        }
         return src_ss[0];
     };
 
     auto handle_pad = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS) {
-            GGML_ASSERT(tensor->op_params[2*src_ss[0].axis + 0] == 0);
-            GGML_ASSERT(tensor->op_params[2*src_ss[0].axis + 1] == 0);
+            if (tensor->op_params[2*src_ss[0].axis + 0] != 0 || tensor->op_params[2*src_ss[0].axis + 1] != 0) {
+                GGML_LOG_WARN("ggml-backend-meta: PAD has non-zero padding along split axis %d — falling back to MIRRORED (tensor: %s)\n", src_ss[0].axis, tensor->name);
+                return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+            }
         }
         return src_ss[0];
     };
 
     auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        GGML_ASSERT(                             src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(                             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(                             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(tensor->src[4] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-        GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
+        if (src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_2 || src_ss[1].axis != GGML_BACKEND_SPLIT_AXIS_2 || src_ss[2].axis != GGML_BACKEND_SPLIT_AXIS_2) {
+            GGML_LOG_WARN("ggml-backend-meta: FLASH_ATTN_EXT sources not split on axis 2 — falling back to MIRRORED (tensor: %s)\n", tensor->name);
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+        }
+        if (tensor->src[4] != nullptr && src_ss[3].axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            GGML_LOG_WARN("ggml-backend-meta: FLASH_ATTN_EXT src[3] not MIRRORED — falling back to MIRRORED (tensor: %s)\n", tensor->name);
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+        }
+        if (tensor->src[4] != nullptr && src_ss[4].axis != GGML_BACKEND_SPLIT_AXIS_0) {
+            GGML_LOG_WARN("ggml-backend-meta: FLASH_ATTN_EXT src[4] not axis-0 split — falling back to MIRRORED (tensor: %s)\n", tensor->name);
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+        }
         return {GGML_BACKEND_SPLIT_AXIS_1, {0}, 1};
     };
 
@@ -785,14 +900,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
         }
-        GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1);
-        GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1);
-        GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_1);
-        GGML_ASSERT(src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_1);
-        GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_1);
+        if (src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_1 || src_ss[1].axis != GGML_BACKEND_SPLIT_AXIS_1 ||
+            src_ss[2].axis != GGML_BACKEND_SPLIT_AXIS_1 || src_ss[3].axis != GGML_BACKEND_SPLIT_AXIS_1 ||
+            src_ss[4].axis != GGML_BACKEND_SPLIT_AXIS_1) {
+            GGML_LOG_WARN("ggml-backend-meta: GATED_DELTA_NET sources not axis-1 split — falling back to MIRRORED (tensor: %s)\n", tensor->name);
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+        }
         // state shape is (S_v*S_v*H, K, n_seqs); the heads dim is nested inside axis 0,
         // so a head-aligned split on the input cache reshapes to axis 0 here (not axis 2).
-        GGML_ASSERT(src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_2 || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_1 || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_0);
+        if (src_ss[5].axis != GGML_BACKEND_SPLIT_AXIS_2 && src_ss[5].axis != GGML_BACKEND_SPLIT_AXIS_1 && src_ss[5].axis != GGML_BACKEND_SPLIT_AXIS_0) {
+            GGML_LOG_WARN("ggml-backend-meta: GATED_DELTA_NET src[5] (state) has unexpected split axis %d — falling back to MIRRORED (tensor: %s)\n", src_ss[5].axis, tensor->name);
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+        }
         return {GGML_BACKEND_SPLIT_AXIS_0, {0}, 1};
     };
 
@@ -823,7 +942,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 continue;
             }
             src_ss[i] = ggml_backend_meta_get_split_state(stc, tensor->src[i], /*assume_sync =*/ true);
-            GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+            // Parameter tensors (op=NONE) may have UNKNOWN split state from callback.
+            // Treat them as MIRRORED since they're typically replicated on all GPUs.
+            if (src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+                src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+            }
         }
 
         ggml_backend_meta_split_state split_state;
@@ -854,12 +977,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_COS: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
-            case GGML_OP_SUM: {
+            case GGML_OP_SUM:
+            case GGML_OP_MEAN: {
+                // Scalar reductions — output is identical on all GPUs.
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case GGML_OP_SUM_ROWS:
             case GGML_OP_CUMSUM:
-            case GGML_OP_MEAN:
             case GGML_OP_ARGMAX:
             case GGML_OP_COUNT_EQUAL: {
                 split_state = handle_per_row(src_ss);
@@ -954,9 +1078,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_PAD: {
                 split_state = handle_pad(src_ss);
             } break;
+            case GGML_OP_ARANGE: {
+                // ARANGE has no data sources — produces identical output on all GPUs.
+                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+            } break;
             case GGML_OP_PAD_REFLECT_1D:
             case GGML_OP_ROLL:
-            case GGML_OP_ARANGE:
             case GGML_OP_TIMESTEP_EMBEDDING: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
@@ -1038,7 +1165,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                         }
                         split_state.ne[j] *= tensor->ne[split_state.axis];
                         if (split_state.ne[j] != 0 || tensor->src[i]->ne[src_ss[i].axis] != 0) {
-                            GGML_ASSERT(split_state.ne[j] % tensor->src[i]->ne[src_ss[i].axis] == 0);
+                            if (split_state.ne[j] % tensor->src[i]->ne[src_ss[i].axis] != 0) {
+                                GGML_LOG_WARN("ggml-backend-meta: %s split ratio mismatch — output ne[%zu]=%lld not divisible by src[%zu] ne[%d]=%lld, falling back to MIRRORED (tensor: %s)\n",
+                                    ggml_op_name(tensor->op), j, (long long)split_state.ne[j], i, (int)src_ss[i].axis, (long long)tensor->src[i]->ne[src_ss[i].axis], tensor->name);
+                                return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+                            }
                             split_state.ne[j] /= tensor->src[i]->ne[src_ss[i].axis];
                         }
                     }
@@ -1049,8 +1180,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                             sum += src_ss[i].ne[s*n_bufs + j];
                         }
                         // Assert that ratio is consistent:
-                        GGML_ASSERT(split_state.ne[j] * tensor->src[i]->ne[src_ss[i].axis]
-                                               == sum * tensor->ne[split_state.axis]);
+                        if (split_state.ne[j] * tensor->src[i]->ne[src_ss[i].axis]
+                                                    != sum * tensor->ne[split_state.axis]) {
+                            GGML_LOG_WARN("ggml-backend-meta: %s split ratio inconsistent — output ne[%zu]=%lld * src[%zu] ne[%d]=%lld != sum=%lld * output ne[%d]=%lld, falling back to MIRRORED (tensor: %s)\n",
+                                ggml_op_name(tensor->op), j, (long long)split_state.ne[j], i, (int)src_ss[i].axis, (long long)tensor->src[i]->ne[src_ss[i].axis], (long long)sum, (int)split_state.axis, (long long)tensor->ne[split_state.axis], tensor->name);
+                            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+                        }
                     }
                 }
                 first_src_split_by_axis = false;
