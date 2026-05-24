@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cassert>
+#include <cmath>
 #include <stdexcept>
 #include <cinttypes>
 #include <set>
@@ -173,12 +174,609 @@ common_device_memory_data_vec common_get_device_memory_data(
     return ret;
 }
 
+// tensor split mode fit implementation
+
+// detect whether ggml_backend_dev_memory returns reliable values for a device
+static bool common_params_fit_is_memory_reliable(ggml_backend_dev_t dev) {
+    size_t free1, total1, free2, total2;
+    ggml_backend_dev_memory(dev, &free1, &total1);
+    if (total1 == 0) {
+        return false;
+    }
+    ggml_backend_dev_memory(dev, &free2, &total2);
+    if (total2 != total1) {
+        return false;
+    }
+    return true;
+}
+
+// measure per-device memory via free-memory delta (requires no_alloc = false)
+static std::vector<int64_t> common_params_fit_tensor_measure(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        const std::vector<ggml_backend_dev_t> & phys_devs) {
+    const size_t n_devs = phys_devs.size();
+    std::vector<int64_t> mem_before(n_devs);
+    std::vector<int64_t> mem_used(n_devs);
+
+    for (size_t i = 0; i < n_devs; i++) {
+        size_t free_mem, total_mem;
+        ggml_backend_dev_memory(phys_devs[i], &free_mem, &total_mem);
+        mem_before[i] = (int64_t)free_mem;
+    }
+
+    llama_model_params mparams_copy = *mparams;
+    mparams_copy.no_alloc  = false;
+    mparams_copy.use_mmap  = true;
+    mparams_copy.use_mlock = false;
+
+    llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
+    if (model == nullptr) {
+        throw common_params_fit_exception("failed to load model during tensor split fit");
+    }
+
+    llama_context * ctx = llama_init_from_model(model, *cparams);
+    if (ctx == nullptr) {
+        llama_model_free(model);
+        throw common_params_fit_exception("failed to create context during tensor split fit");
+    }
+
+    for (size_t i = 0; i < n_devs; i++) {
+        size_t free_after, total_mem;
+        ggml_backend_dev_memory(phys_devs[i], &free_after, &total_mem);
+        mem_used[i] = mem_before[i] - (int64_t)free_after;
+        if (mem_used[i] < 0) {
+            mem_used[i] = 0;
+        }
+    }
+
+    llama_free(ctx);
+    llama_model_free(model);
+    return mem_used;
+}
+
+// stage 1: dry-run feasibility check (no_alloc = true)
+static bool common_params_fit_tensor_check_feasibility(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        const std::vector<ggml_backend_dev_t> & phys_devs,
+        const std::vector<int64_t> & max_allowed) {
+    const size_t n_devs = phys_devs.size();
+
+    int64_t total_allowed = 0;
+    for (size_t i = 0; i < n_devs; i++) {
+        total_allowed += max_allowed[i];
+    }
+
+    llama_model_params mparams_copy = *mparams;
+    mparams_copy.no_alloc  = true;
+    mparams_copy.use_mmap  = false;
+    mparams_copy.use_mlock = false;
+
+    llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
+    if (model == nullptr) {
+        return false;
+    }
+
+    llama_context * ctx = llama_init_from_model(model, *cparams);
+    if (ctx == nullptr) {
+        llama_model_free(model);
+        return false;
+    }
+
+    llama_memory_breakdown breakdown = llama_get_memory_breakdown(ctx);
+    int64_t total_required = 0;
+    for (const auto & buft_data : breakdown) {
+        // only count GPU memory — CPU/host memory is not constrained by VRAM
+        if (ggml_backend_buft_is_host(buft_data.first)) {
+            continue;
+        }
+        total_required += (int64_t)buft_data.second.total();
+    }
+
+    llama_free(ctx);
+    llama_model_free(model);
+
+    return total_required <= total_allowed;
+}
+
+// OLS linear regression: mem = S * w + M
+// estimates split memory (S) and mirrored memory (M) from measurement history
+static void common_params_fit_tensor_ols_fit(
+        const std::vector<std::vector<float>> & w_history,
+        const std::vector<std::vector<int64_t>> & mem_history,
+        double & s_fit,
+        double & m_fit,
+        double & max_residual) {
+    double sum_x  = 0.0;
+    double sum_y  = 0.0;
+    double sum_xx = 0.0;
+    double sum_xy = 0.0;
+    int n = 0;
+
+    for (size_t m = 0; m < w_history.size(); m++) {
+        for (size_t i = 0; i < w_history[m].size(); i++) {
+            double x = (double)w_history[m][i];
+            double y = (double)mem_history[m][i];
+            sum_x  += x;
+            sum_y  += y;
+            sum_xx += x * x;
+            sum_xy += x * y;
+            n++;
+        }
+    }
+
+    double denom = (double)n * sum_xx - sum_x * sum_x;
+    if (denom == 0.0) {
+        // all weights are identical — cannot fit slope
+        s_fit = 0.0;
+        m_fit = sum_y / (double)n;
+        max_residual = 0.0;
+        return;
+    }
+
+    s_fit = ((double)n * sum_xy - sum_x * sum_y) / denom;
+    m_fit = (sum_y - s_fit * sum_x) / (double)n;
+
+    // compute max relative residual
+    max_residual = 0.0;
+    for (size_t m = 0; m < w_history.size(); m++) {
+        for (size_t i = 0; i < w_history[m].size(); i++) {
+            double predicted = s_fit * (double)w_history[m][i] + m_fit;
+            double actual    = (double)mem_history[m][i];
+            if (actual == 0.0) {
+                continue;
+            }
+            double rel = fabs(predicted - actual) / actual;
+            if (rel > max_residual) {
+                max_residual = rel;
+            }
+        }
+    }
+}
+
+// direct weight assignment from S, M estimates. Returns false if infeasible.
+static bool common_params_fit_tensor_assign_weights(
+        double s_fit,
+        double m_fit,
+        double safety,
+        const std::vector<int64_t> & max_allowed,
+        float * tensor_split,
+        size_t n_devs) {
+    double sum_max = 0.0;
+    std::vector<double> w_max(n_devs);
+
+    for (size_t i = 0; i < n_devs; i++) {
+        if ((double)max_allowed[i] <= m_fit) {
+            // GPU too small to hold mirrored tensors alone
+            return false;
+        }
+        w_max[i] = fmax(0.0, ((double)max_allowed[i] - m_fit) / s_fit * safety);
+        sum_max += w_max[i];
+    }
+
+    if (sum_max < 1.0) {
+        return false;
+    }
+
+    for (size_t i = 0; i < n_devs; i++) {
+        tensor_split[i] = (float)(w_max[i] / sum_max);
+    }
+    return true;
+}
+
+// additive shift fallback for non-linear cases (MoE, block alignment)
+static void common_params_fit_tensor_additive_shift(
+        const float * w,
+        const int64_t * mem_used,
+        const int64_t * max_allowed,
+        double s_est,
+        float * w_out,
+        size_t n_devs) {
+    double total_deficit  = 0.0;
+    double total_surplus  = 0.0;
+
+    for (size_t i = 0; i < n_devs; i++) {
+        if (mem_used[i] > max_allowed[i]) {
+            total_deficit += (double)(mem_used[i] - max_allowed[i]);
+        } else {
+            total_surplus += (double)(max_allowed[i] - mem_used[i]);
+        }
+    }
+
+    // copy input weights
+    for (size_t i = 0; i < n_devs; i++) {
+        w_out[i] = w[i];
+    }
+
+    const double damping = 0.8;
+
+    for (size_t i = 0; i < n_devs; i++) {
+        if (mem_used[i] > max_allowed[i]) {
+            // overloaded: reduce weight proportional to deficit
+            double weight_to_lose = ((double)(mem_used[i] - max_allowed[i]) / s_est) * damping;
+            w_out[i] -= (float)weight_to_lose;
+            if (w_out[i] < 0.001f) {
+                w_out[i] = 0.001f;
+            }
+        } else if (total_surplus > 0) {
+            // underloaded: gain weight proportional to share of surplus
+            double share = (double)(max_allowed[i] - mem_used[i]) / total_surplus;
+            double weight_to_gain = (total_deficit / s_est) * share * damping;
+            w_out[i] += (float)weight_to_gain;
+        }
+    }
+
+    // normalize
+    float sum = 0.0f;
+    for (size_t i = 0; i < n_devs; i++) {
+        sum += w_out[i];
+    }
+    for (size_t i = 0; i < n_devs; i++) {
+        w_out[i] /= sum;
+    }
+}
+
+// compute per-device KV cache memory per token from model metadata
+static void common_params_fit_tensor_kv_per_token(
+        const llama_model * model,
+        const llama_context_params * cparams,
+        const float * tensor_split,
+        size_t n_devs,
+        int64_t * kv_per_token_out) {
+    const int32_t n_layers   = llama_model_n_layer(model);
+    const int32_t n_kv_heads = llama_model_n_head_kv(model);
+    const int32_t n_embd     = llama_model_n_embd(model);
+    const int32_t n_heads    = llama_model_n_head(model);
+    const int32_t head_dim   = n_heads > 0 ? n_embd / n_heads : n_embd;
+    const size_t bytes_per_elem = ggml_type_size(cparams->type_k)
+                                + ggml_type_size(cparams->type_v);
+
+    // heads-per-device from cumulative tensor_split (integer-quantized)
+    std::vector<int> heads_per_device(n_devs);
+    float cumulative = 0.0f;
+    int assigned = 0;
+    int prev_cumulative_heads = 0;
+    for (size_t i = 0; i < n_devs; i++) {
+        cumulative += tensor_split[i];
+        int cum_heads = (int)round((double)n_kv_heads * cumulative);
+        heads_per_device[i] = cum_heads - prev_cumulative_heads;
+        prev_cumulative_heads = cum_heads;
+        assigned += heads_per_device[i];
+    }
+    // adjust last device for rounding errors
+    heads_per_device[n_devs - 1] += n_kv_heads - assigned;
+
+    for (size_t i = 0; i < n_devs; i++) {
+        kv_per_token_out[i] = (int64_t)heads_per_device[i] * head_dim
+                             * n_layers * (int64_t)bytes_per_elem;
+    }
+}
+
+// main tensor split mode fit implementation
+static void common_params_fit_tensor_impl(
+        const char * path_model,
+        llama_model_params * mparams,
+        llama_context_params * cparams,
+        float * tensor_split,
+        llama_model_tensor_buft_override * tensor_buft_overrides,
+        size_t * margins_s,
+        uint32_t n_ctx_min,
+        ggml_log_level log_level) {
+    constexpr int64_t MiB = 1024*1024;
+
+    // collect physical devices
+    std::vector<ggml_backend_dev_t> phys_devs;
+    if (mparams->devices != nullptr) {
+        for (size_t i = 0; mparams->devices[i] != nullptr; i++) {
+            phys_devs.push_back(mparams->devices[i]);
+        }
+    } else {
+        // enumerate all GPU devices from the backend registry
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                phys_devs.push_back(dev);
+            }
+        }
+    }
+    const size_t n_devs = phys_devs.size();
+    if (n_devs <= 1) {
+        return; // nothing to balance
+    }
+
+    // check backend reliability
+    bool all_reliable = true;
+    for (size_t i = 0; i < n_devs; i++) {
+        if (!common_params_fit_is_memory_reliable(phys_devs[i])) {
+            all_reliable = false;
+            break;
+        }
+    }
+    if (!all_reliable) {
+        LOG_WRN("%s: unreliable memory query on one or more backends, "
+                "using conservative proportional estimation\n", __func__);
+        // fall back: use equal splits
+        for (size_t i = 0; i < n_devs; i++) {
+            tensor_split[i] = 1.0f;
+        }
+        float sum = 0.0f;
+        for (size_t i = 0; i < n_devs; i++) sum += tensor_split[i];
+        for (size_t i = 0; i < n_devs; i++) tensor_split[i] /= sum;
+        mparams->tensor_split = tensor_split;
+        return;
+    }
+
+    // get device free memory and max allowed (with margins)
+    std::vector<int64_t> max_allowed(n_devs);
+    int64_t total_allowed = 0;
+    for (size_t i = 0; i < n_devs; i++) {
+        size_t free_mem, total_mem;
+        ggml_backend_dev_memory(phys_devs[i], &free_mem, &total_mem);
+        max_allowed[i] = (free_mem > margins_s[i]) ? (int64_t)(free_mem - margins_s[i]) : 0;
+        total_allowed += max_allowed[i];
+    }
+
+    // warn if user passed non-uniform tensor_split
+    {
+        bool uniform = true;
+        for (size_t i = 1; i < n_devs; i++) {
+            if (fabs((double)tensor_split[i] - (double)tensor_split[0]) > 0.001) {
+                uniform = false;
+                break;
+            }
+        }
+        if (!uniform) {
+            LOG_WRN("%s: user-provided tensor_split will be overwritten by --fit\n", __func__);
+        }
+    }
+
+    // working weight array
+    std::vector<float> w(n_devs);
+
+    const int MAX_MEASUREMENTS = 4;
+
+    // get model layer count for tensor_buft_overrides fallback
+    int32_t n_layers = 0;
+    {
+        llama_model_params mparams_probe = *mparams;
+        mparams_probe.no_alloc  = true;
+        mparams_probe.use_mmap  = false;
+        mparams_probe.use_mlock = false;
+        llama_model * model_probe = llama_model_load_from_file(path_model, mparams_probe);
+        if (model_probe != nullptr) {
+            n_layers = llama_model_n_layer(model_probe);
+            llama_model_free(model_probe);
+        }
+    }
+
+    // resolve "auto"/"all" n_gpu_layers (negative values) to the actual layer count
+    // so the solver loop condition (>= 0) and reduction fallback work correctly.
+    if (mparams->n_gpu_layers < 0 && n_layers > 0) {
+        mparams->n_gpu_layers = n_layers;
+    }
+
+    // pattern storage for tensor_buft_overrides (must outlive the solver loop)
+    const size_t ntbo = llama_max_tensor_buft_overrides();
+    std::vector<std::string> tbo_patterns;
+    tbo_patterns.reserve(n_layers);
+    ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+    int32_t n_layers_offloaded = 0; // number of layers currently offloaded to CPU via overrides
+
+    // helper to write current overrides into tensor_buft_overrides buffer and set on mparams
+    auto apply_tbo = [&]() {
+        for (int32_t il = 0; il < n_layers_offloaded && (size_t)il + 1 < ntbo; il++) {
+            tensor_buft_overrides[il].pattern = tbo_patterns[il].c_str();
+            tensor_buft_overrides[il].buft    = cpu_buft;
+        }
+        tensor_buft_overrides[n_layers_offloaded].pattern = nullptr;
+        tensor_buft_overrides[n_layers_offloaded].buft    = nullptr;
+        mparams->tensor_buft_overrides = tensor_buft_overrides;
+    };
+
+    // outer loop: reduce n_gpu_layers if needed
+    // (in tensor mode, n_gpu_layers controls meta-device vs CPU offload)
+    while (mparams->n_gpu_layers >= 0) {
+        // ---- stage 1: dry-run feasibility check ----
+        if (!common_params_fit_tensor_check_feasibility(
+                path_model, mparams, cparams, phys_devs, max_allowed))
+        {
+            // globally infeasible — no weight redistribution can help
+            if (mparams->n_gpu_layers > 0) {
+                mparams->n_gpu_layers--;
+                LOG_TRC("%s: total memory exceeds VRAM, reducing n_gpu_layers to %u\n",
+                        __func__, mparams->n_gpu_layers);
+                continue;
+            }
+            // no more layers to offload — try context reduction
+            // (handled below after weight solver fails)
+            break;
+        }
+
+        // ---- stage 2: proportional first load ----
+        // initialize weights proportional to free memory
+        float sum_free = 0.0f;
+        for (size_t i = 0; i < n_devs; i++) {
+            w[i] = (float)max_allowed[i];
+            sum_free += w[i];
+        }
+        for (size_t i = 0; i < n_devs; i++) {
+            w[i] /= sum_free;
+        }
+
+        mparams->tensor_split = w.data();
+        std::vector<int64_t> mem_used = common_params_fit_tensor_measure(
+            path_model, mparams, cparams, phys_devs);
+
+        // ---- stage 3: weight solver loop ----
+        std::vector<std::vector<float>> w_history;
+        std::vector<std::vector<int64_t>> mem_history;
+        bool converged = false;
+
+        for (int iter = 0; iter < MAX_MEASUREMENTS; iter++) {
+            w_history.push_back(w);
+            mem_history.push_back(mem_used);
+
+            // check if all devices fit
+            bool all_ok = true;
+            for (size_t i = 0; i < n_devs; i++) {
+                if (mem_used[i] > max_allowed[i]) {
+                    all_ok = false;
+                    break;
+                }
+            }
+            if (all_ok) {
+                converged = true;
+                // success — write final weights to caller's buffer
+                for (size_t i = 0; i < n_devs; i++) {
+                    tensor_split[i] = w[i];
+                }
+                mparams->tensor_split = tensor_split;
+
+                // log results
+                LOG_INF("%s: tensor split fit succeeded:\n", __func__);
+                if (n_layers_offloaded > 0) {
+                    LOG_INF("%s:   offloaded %d layer(s) to CPU via tensor_buft_overrides\n",
+                            __func__, n_layers_offloaded);
+                }
+                for (size_t i = 0; i < n_devs; i++) {
+                    LOG_INF("%s:   - %s: %6" PRId64 " MiB used / %6" PRId64 " MiB allowed (margin: %6" PRId64 " MiB)\n",
+                            __func__, ggml_backend_dev_name(phys_devs[i]),
+                            mem_used[i] / MiB, max_allowed[i] / MiB,
+                            (max_allowed[i] - mem_used[i]) / MiB);
+                }
+                LOG_INF("%s:   tensor_split = [", __func__);
+                for (size_t i = 0; i < n_devs; i++) {
+                    LOG_INF("%s:    %.3f%s", __func__, w[i], (i + 1 < n_devs) ? ", " : "");
+                }
+                LOG_INF("%s:   ]\n", __func__);
+
+                // estimate S and M for logging
+                double s_fit, m_fit, max_residual;
+                common_params_fit_tensor_ols_fit(w_history, mem_history, s_fit, m_fit, max_residual);
+                LOG_INF("%s:   S_fit = %" PRId64 " MiB, M_fit = %" PRId64 " MiB, max_residual = %.1f%%\n",
+                        __func__, (int64_t)s_fit / MiB, (int64_t)m_fit / MiB, max_residual * 100.0);
+
+                return;
+            }
+
+            // OLS fit
+            double s_fit, m_fit, max_residual;
+            common_params_fit_tensor_ols_fit(w_history, mem_history, s_fit, m_fit, max_residual);
+
+            double safety = (w_history.size() == 1) ? 0.97 : 1.0;
+
+            if (max_residual < 0.10 && s_fit > 0 && m_fit >= 0) {
+                // linear model holds — direct assignment
+                if (!common_params_fit_tensor_assign_weights(
+                        s_fit, m_fit, safety, max_allowed, w.data(), n_devs))
+                {
+                    // infeasible
+                    goto solver_failed;
+                }
+            } else {
+                // linear model broken — additive shift fallback
+                if (s_fit <= 0) {
+                    // cannot estimate S — use total used as approximation
+                    int64_t total_used = 0;
+                    for (size_t i = 0; i < n_devs; i++) {
+                        total_used += mem_used[i];
+                    }
+                    s_fit = (double)total_used;
+                }
+                common_params_fit_tensor_additive_shift(
+                    w.data(), mem_used.data(), max_allowed.data(),
+                    s_fit, w.data(), n_devs);
+            }
+
+            mparams->tensor_split = w.data();
+            mem_used = common_params_fit_tensor_measure(
+                path_model, mparams, cparams, phys_devs);
+        }
+
+        solver_failed:
+        if (converged) {
+            return; // already returned above
+        }
+
+        // ---- context reduction fallback (at most once per solver failure) ----
+        // compute per-device KV per-token and reduce context if it would help.
+        // we do not loop back to the solver here — if the reduction isn't enough,
+        // we fall through to tensor_buft_overrides / n_gpu_layers reduction below.
+        {
+            llama_model_params mparams_copy = *mparams;
+            mparams_copy.no_alloc = true;
+            llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
+            if (model != nullptr) {
+                std::vector<int64_t> kv_per_token(n_devs);
+                common_params_fit_tensor_kv_per_token(model, cparams, w.data(), n_devs, kv_per_token.data());
+                llama_model_free(model);
+
+                // find device with largest deficit-per-unit-KV
+                int32_t worst = -1;
+                double worst_ratio = 0.0;
+                for (size_t i = 0; i < n_devs; i++) {
+                    if (mem_used[i] <= max_allowed[i]) {
+                        continue;
+                    }
+                    double deficit = (double)(mem_used[i] - max_allowed[i]);
+                    double ratio = deficit / (double)kv_per_token[i];
+                    if (ratio > worst_ratio) {
+                        worst_ratio = ratio;
+                        worst = (int32_t)i;
+                    }
+                }
+
+                if (worst >= 0) {
+                    uint32_t reduction = (uint32_t)ceil(worst_ratio);
+                    if (cparams->n_ctx > reduction + n_ctx_min) {
+                        cparams->n_ctx -= reduction;
+                        LOG_TRC("%s: reducing n_ctx to %u to satisfy device %zu\n",
+                                __func__, cparams->n_ctx, (size_t)worst);
+                    }
+                }
+            }
+        }
+
+        // ---- tensor_buft_overrides fallback: offload layers to CPU ----
+        if (n_layers > 0 && n_layers_offloaded < n_layers && (size_t)(n_layers_offloaded + 1) < ntbo) {
+            // offload the next layer (front-to-back, matching n_gpu_layers direction)
+            int32_t il = n_layers_offloaded;
+            tbo_patterns.push_back("blk\\." + std::to_string(il) + "\\..*");
+            n_layers_offloaded++;
+            apply_tbo();
+
+            LOG_TRC("%s: offloading layer %d to CPU via tensor_buft_overrides (%d layers offloaded)\n",
+                    __func__, il, n_layers_offloaded);
+            continue;
+        }
+
+        // cannot reduce context further and no more layers to offload via overrides
+        if (mparams->n_gpu_layers > 0) {
+            mparams->n_gpu_layers--;
+            LOG_TRC("%s: context reduction exhausted, reducing n_gpu_layers to %u\n",
+                    __func__, mparams->n_gpu_layers);
+            continue;
+        }
+
+        // nothing left to reduce
+        break;
+    }
+
+    throw common_params_fit_exception("cannot fit model with SPLIT_MODE_TENSOR");
+}
+
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins_s, uint32_t n_ctx_min, enum ggml_log_level log_level) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-        throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
+        common_params_fit_tensor_impl(path_model, mparams, cparams,
+            tensor_split, tensor_buft_overrides, margins_s, n_ctx_min, log_level);
+        return;
     }
     constexpr int64_t MiB = 1024*1024;
     typedef std::vector<llama_device_memory_data> dmds_t;
