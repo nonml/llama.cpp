@@ -309,3 +309,15 @@ if (TARGET gguf-model-data)
     target_link_libraries(export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# TurboQuant round-trip: plain C, links directly against llama (which includes ggml-turbo-quant)
+get_filename_component(TEST_TARGET test-turbo-quant.c NAME_WE)
+add_executable(${TEST_TARGET} test-turbo-quant.c)
+target_link_libraries(${TEST_TARGET} PRIVATE llama)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS main)
+
+# Turbo fused-attention CPU support check
+if (NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-cpu-fattn-support.cpp)
+endif()

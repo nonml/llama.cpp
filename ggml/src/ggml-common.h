@@ -278,6 +278,96 @@ typedef struct {
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
 //
+// TurboQuant
+//
+
+// TurboQuant 3-bit: 3-bit PolarQuant + 1-bit QJL
+// One block = one 128-element rotation group.
+// Per block: norm(fp16) + 2-bit indices (32 bytes) + 1-bit extra (16 bytes) = 50 bytes per 128 values
+// = 3.125 bits/value -> 5.12x storage compression vs fp16
+// The 3-bit index is split: lower 2 bits in qs[], upper 1 bit in signs[]
+#define TBQK3_0 128
+#define TBQK3_0_GROUP 128  // rotation group size = head_dim
+typedef struct {
+    ggml_half  norm;                    //  2 bytes: vector L2 norm (for rescaling)
+    uint8_t    qs[TBQK3_0 / 4];      // 32 bytes: lower 2-bit indices (4 per byte)
+    uint8_t    signs[TBQK3_0 / 8];   // 16 bytes: upper 1-bit of 3-bit index (8 per byte)
+} block_tbq3_0;                       // 50 bytes total
+static_assert(sizeof(block_tbq3_0) == sizeof(ggml_half) + TBQK3_0/4 + TBQK3_0/8, "wrong tbq3_0 block size/padding");
+
+// TurboQuant 2-bit: 2-bit PolarQuant indices, no QJL
+// One block = one 128-element rotation group.
+// Per block: norm(fp16) + 2-bit indices (TBQK2_0/4 bytes)
+// = 34 bytes per 128 values = 2.125 bits/value -> 7.53x storage compression vs fp16
+#define TBQK2_0 128
+#define TBQK2_0_GROUP 128
+typedef struct {
+    ggml_half  norm;                    //  2 bytes: corrected vector L2 norm
+    uint8_t    qs[TBQK2_0 / 4];      // 32 bytes: 2-bit indices (4 per byte)
+} block_tbq2_0;                       // 34 bytes total
+static_assert(sizeof(block_tbq2_0) == sizeof(ggml_half) + TBQK2_0/4, "wrong tbq2_0 block size/padding");
+
+// TurboQuant 3-bit TCQ: Trellis-Coded Quantization (right-shift bitshift trellis, k=3, L=9)
+// One block = one 128-element rotation group. Bitstream: 6 zero-prefix + 128*3-bit outputs = 390 bits = 49 bytes.
+// Decode: state_t = read_9_bits(qs, t*3), recon_t = codebook[state_t] * norm
+// Stored struct size is 52 bytes per 128 values = 3.25 bits/value -> 4.92x storage compression vs fp16
+#define TBQK3_TCQ 128
+typedef struct {
+    ggml_half  norm;                    //  2 bytes: corrected group L2 norm
+    uint8_t    qs[49];                  // 49 bytes: 390-bit trellis bitstream (2 padding bits)
+    uint8_t    pad;                     //  1 byte:  alignment padding
+} block_tbq3_tcq;                     // 52 bytes total for 128 values (3.25 bpv)
+static_assert(sizeof(block_tbq3_tcq) == sizeof(ggml_half) + 50, "wrong tbq3_tcq block size/padding");
+
+// TurboQuant 2-bit TCQ: Trellis-Coded Quantization (right-shift bitshift trellis, k=2, L=8)
+// One block = one 128-element rotation group. Bitstream: 6 prefix + 128*2-bit outputs = 262 bits = 33 bytes.
+// Decode: state_t = read_8_bits(qs, t*2), recon_t = codebook[state_t] * norm
+// Stored struct size is 36 bytes per 128 values = 2.25 bits/value -> 7.11x storage compression vs fp16
+#define TBQK2_TCQ 128
+typedef struct {
+    ggml_half  norm;                    //  2 bytes: corrected group L2 norm
+    uint8_t    qs[33];                  // 33 bytes: 262-bit trellis bitstream (2 padding bits)
+    uint8_t    pad;                     //  1 byte:  alignment padding
+} block_tbq2_tcq;                     // 36 bytes total for 128 values (2.25 bpv)
+static_assert(sizeof(block_tbq2_tcq) == sizeof(ggml_half) + 34, "wrong tbq2_tcq block size/padding");
+
+// TurboQuant 4-bit: 16-level PolarQuant (Lloyd-Max optimal for post-WHT Gaussian)
+// Per block: norm(fp16) + 4-bit indices (64 bytes)
+// = 66 bytes per 128 values = 4.125 bits/value -> 3.88x storage compression vs fp16
+#define TBQK4_0 128
+typedef struct {
+    ggml_half  norm;                    //  2 bytes: L2 norm for rescaling
+    uint8_t    qs[TBQK4_0 / 2];      // 64 bytes: 4-bit indices (2 per byte, low nibble first)
+} block_tbq4_0;                       // 66 bytes total
+static_assert(sizeof(block_tbq4_0) == sizeof(ggml_half) + TBQK4_0/2, "wrong turbo4_0 block size/padding");
+
+//
+// Lloyd-Max
+//
+
+// WHT-rotated 8-level Lloyd-Max, block_size=32
+// Dual half-block scales (d0 for [0..15], d1 for [16..31])
+// Per block: d0(fp16) + d1(fp16) + 3-bit indices packed (12 bytes) = 16 bytes per 32 values
+#define TBQK3_1S 32
+typedef struct {
+    ggml_half d0;                      //  2 bytes: scale for first half
+    ggml_half d1;                      //  2 bytes: scale for second half
+    uint8_t   qs[TBQK3_1S * 3 / 8]; // 12 bytes: 3-bit indices
+} block_tbq3_1s;                     // 16 bytes total
+static_assert(sizeof(block_tbq3_1s) == 16, "wrong tbq3_1s block size");
+
+// WHT-rotated 16-level Lloyd-Max, block_size=32
+// Dual half-block scales (d0 for [0..15], d1 for [16..31])
+// Per block: d0(fp16) + d1(fp16) + 4-bit indices packed (16 bytes) = 20 bytes per 32 values
+#define TBQK4_1S 32
+typedef struct {
+    ggml_half d0;                      //  2 bytes: scale for first half
+    ggml_half d1;                      //  2 bytes: scale for second half
+    uint8_t   qs[TBQK4_1S / 2];   // 16 bytes: 4-bit indices
+} block_tbq4_1s;                     // 20 bytes total
+static_assert(sizeof(block_tbq4_1s) == 20, "wrong turbo4_1s block size");
+
+//
 // Super-block quantization structures
 //
 

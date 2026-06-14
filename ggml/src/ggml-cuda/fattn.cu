@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-mma-turbo.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
@@ -330,11 +331,12 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
-    BEST_FATTN_KERNEL_NONE     =   0,
-    BEST_FATTN_KERNEL_TILE     = 200,
-    BEST_FATTN_KERNEL_VEC      = 100,
-    BEST_FATTN_KERNEL_WMMA_F16 = 300,
-    BEST_FATTN_KERNEL_MMA_F16  = 400,
+    BEST_FATTN_KERNEL_NONE       =   0,
+    BEST_FATTN_KERNEL_TILE       = 200,
+    BEST_FATTN_KERNEL_VEC        = 100,
+    BEST_FATTN_KERNEL_WMMA_F16   = 300,
+    BEST_FATTN_KERNEL_MMA_F16    = 400,
+    BEST_FATTN_KERNEL_MMA_TURBO  = 500, // TBQ types: fused dequant inside MMA kernel
 };
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
@@ -441,6 +443,24 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
             break;
+        // TurboQuant KV cache types - handled by BEST_FATTN_KERNEL_MMA_TURBO
+        case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_TBQ2_0:
+            // TBQ only supports D=128 and D=256, K==V type, MMA hardware required.
+            if (V->type != K->type) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            if (K->ne[0] != 128 && K->ne[0] != 256) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            if (V->ne[0] != K->ne[0]) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            if (!turing_mma_available(cc) && !volta_mma_available(cc)) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            return BEST_FATTN_KERNEL_MMA_TURBO;
         default:
             return BEST_FATTN_KERNEL_NONE;
     }
@@ -558,6 +578,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = true;
             need_f16_V = true;
             break;
+        case BEST_FATTN_KERNEL_MMA_TURBO:
+            // Raw TBQ data passes through - no f16 conversion needed.
+            need_f16_K = false;
+            need_f16_V = false;
+            break;
         case BEST_FATTN_KERNEL_VEC:
             need_f16_K = K->type == GGML_TYPE_F32;
             need_f16_V = V->type == GGML_TYPE_F32;
@@ -570,6 +595,124 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
         ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
 
     return f16_extra.end - (uintptr_t) dst->data;
+}
+
+// Persistent per-device Q rotation buffer (grow-only, never freed during session).
+static float * q_rot_buf[GGML_CUDA_MAX_DEVICES]      = {};
+static size_t  q_rot_buf_size[GGML_CUDA_MAX_DEVICES] = {};
+
+// Forward FWHT rotation for Q: signs1 -> FWHT128 -> signs2, with optional InnerQ
+// inverse channel scale (defaults to 1.0 when InnerQ is not calibrated, so it is safe
+// to apply unconditionally for both TBQ3_0 and TBQ4_0).
+// One block per 128-element Q group, 128 threads per block.
+static __global__ void k_turbo_fwht_forward_q(
+        const float * __restrict__ src, float * __restrict__ dst,
+        const int64_t n_elements) {
+    const int64_t offset = blockIdx.x * 128;
+    if (offset >= n_elements) return;
+    const int tid = threadIdx.x;
+
+    __shared__ float buf[128];
+
+    // Apply InnerQ inverse scale then signs1 (scale is identity when InnerQ disabled).
+    float v = src[offset + tid] * d_innerq_channel_scale_inv_fattn[tid] * d_turbo_wht_signs1_fattn[tid];
+
+    // Intra-warp butterfly stages h=1..16 via shuffle (no smem, no sync).
+    const int lane = tid & 31;
+    for (int h = 1; h < 32; h <<= 1) {
+        const float other = __shfl_xor_sync(0xFFFFFFFF, v, h);
+        v = (lane & h) ? (other - v) : (v + other);
+    }
+    buf[tid] = v;
+    __syncthreads();
+
+    // Cross-warp stage h=32.
+    if (tid < 64) {
+        const int j = ((tid >> 5) << 6) + (tid & 31);
+        float a = buf[j], b = buf[j + 32];
+        buf[j] = a + b; buf[j + 32] = a - b;
+    }
+    __syncthreads();
+
+    // Cross-warp stage h=64.
+    if (tid < 64) {
+        float a = buf[tid], b = buf[tid + 64];
+        buf[tid] = a + b; buf[tid + 64] = a - b;
+    }
+    __syncthreads();
+
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    dst[offset + tid] = buf[tid] * inv_sqrt_128 * d_turbo_wht_signs2_fattn[tid];
+}
+
+// TurboQuant MMA dispatch: selects ncols1/ncols2 and type, calls turbo case.
+// Only D=128 and D=256 are supported (matched K=V type).
+static void ggml_cuda_flash_attn_ext_mma_turbo(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+
+    // K/V are stored in FWHT-rotated space. Pre-rotate Q by the same transform so that
+    // (R·Q)·(R·K)^T = Q·K^T (rotation is an isometry). TBQ2_0 uses a different scheme
+    // and does not need Q pre-rotation.
+    const bool needs_q_rotation = (K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0);
+
+    int device;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaStream_t stream = ctx.stream();
+
+    ggml_tensor Q_rot;
+    ggml_tensor * orig_q = nullptr;
+
+    if (needs_q_rotation && Q->ne[0] % 128 == 0) {
+        const size_t q_size = (size_t)ggml_nelements(Q) * sizeof(float);
+        if (q_size > q_rot_buf_size[device]) {
+            if (q_rot_buf[device]) { CUDA_CHECK(cudaFree(q_rot_buf[device])); }
+            CUDA_CHECK(cudaMalloc(&q_rot_buf[device], q_size));
+            q_rot_buf_size[device] = q_size;
+        }
+        const int64_t n_q_groups = ggml_nelements(Q) / 128;
+        k_turbo_fwht_forward_q<<<(int)n_q_groups, 128, 0, stream>>>(
+            (const float *)Q->data, q_rot_buf[device], ggml_nelements(Q));
+        Q_rot = *Q;
+        Q_rot.data = q_rot_buf[device];
+        orig_q = dst->src[0];
+        dst->src[0] = &Q_rot;
+    }
+
+    // ncols1 x ncols2 selection: for turbo we cap ncols2 at 8 (no gqa opt).
+    const int ne1 = (int)Q->ne[1];
+    const int ncols1 = ne1 <= 8 ? 8 : (ne1 <= 16 ? 16 : (ne1 <= 32 ? 32 : 64));
+    const int ncols2 = 1; // straight same-type K=V, no gqa split needed
+
+    const ggml_type tK = K->type;
+
+#define DISPATCH_TURBO(DKQ, DV)                                                     \
+    if (tK == GGML_TYPE_TBQ4_0) {                                                   \
+        if      (ncols1 ==  8) ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ,DV, 8,1,GGML_TYPE_TBQ4_0,GGML_TYPE_TBQ4_0>(ctx,dst); \
+        else if (ncols1 == 16) ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ,DV,16,1,GGML_TYPE_TBQ4_0,GGML_TYPE_TBQ4_0>(ctx,dst); \
+        else if (ncols1 == 32) ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ,DV,32,1,GGML_TYPE_TBQ4_0,GGML_TYPE_TBQ4_0>(ctx,dst); \
+        else                   ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ,DV,64,1,GGML_TYPE_TBQ4_0,GGML_TYPE_TBQ4_0>(ctx,dst); \
+    } else if (tK == GGML_TYPE_TBQ3_0) {                                            \
+        if      (ncols1 ==  8) ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ,DV, 8,1,GGML_TYPE_TBQ3_0,GGML_TYPE_TBQ3_0>(ctx,dst); \
+        else if (ncols1 == 16) ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ,DV,16,1,GGML_TYPE_TBQ3_0,GGML_TYPE_TBQ3_0>(ctx,dst); \
+        else if (ncols1 == 32) ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ,DV,32,1,GGML_TYPE_TBQ3_0,GGML_TYPE_TBQ3_0>(ctx,dst); \
+        else                   ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ,DV,64,1,GGML_TYPE_TBQ3_0,GGML_TYPE_TBQ3_0>(ctx,dst); \
+    } else {  /* GGML_TYPE_TBQ2_0 */                                                 \
+        if      (ncols1 ==  8) ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ,DV, 8,1,GGML_TYPE_TBQ2_0,GGML_TYPE_TBQ2_0>(ctx,dst);  \
+        else if (ncols1 == 16) ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ,DV,16,1,GGML_TYPE_TBQ2_0,GGML_TYPE_TBQ2_0>(ctx,dst);  \
+        else if (ncols1 == 32) ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ,DV,32,1,GGML_TYPE_TBQ2_0,GGML_TYPE_TBQ2_0>(ctx,dst);  \
+        else                   ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ,DV,64,1,GGML_TYPE_TBQ2_0,GGML_TYPE_TBQ2_0>(ctx,dst);  \
+    }
+
+    if (K->ne[0] == 128) {
+        DISPATCH_TURBO(128, 128)
+    } else {
+        GGML_ASSERT(K->ne[0] == 256);
+        DISPATCH_TURBO(256, 256)
+    }
+#undef DISPATCH_TURBO
+
+    if (orig_q) { dst->src[0] = orig_q; }
 }
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -588,6 +731,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_MMA_TURBO:
+            ggml_cuda_flash_attn_ext_mma_turbo(ctx, dst);
             break;
     }
 }

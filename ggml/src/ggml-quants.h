@@ -35,6 +35,7 @@ GGML_API void quantize_row_q8_K_ref(const float * GGML_RESTRICT x, block_q8_K * 
 GGML_API void quantize_row_tq1_0_ref(const float * GGML_RESTRICT x, block_tq1_0 * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_tq2_0_ref(const float * GGML_RESTRICT x, block_tq2_0 * GGML_RESTRICT y, int64_t k);
 
+
 GGML_API void quantize_row_iq3_xxs_ref(const float * GGML_RESTRICT x, block_iq3_xxs * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_iq4_nl_ref (const float * GGML_RESTRICT x, block_iq4_nl  * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_iq4_xs_ref (const float * GGML_RESTRICT x, block_iq4_xs  * GGML_RESTRICT y, int64_t k);
@@ -106,6 +107,35 @@ GGML_API void iq2xs_init_impl(enum ggml_type type);
 GGML_API void iq2xs_free_impl(enum ggml_type type);
 GGML_API void iq3xs_init_impl(int grid_size);
 GGML_API void iq3xs_free_impl(int grid_size);
+
+// TurboQuant KV cache compression (arXiv 2504.19874)
+GGML_API void quantize_row_tbq2_0_ref(const float * GGML_RESTRICT x, block_tbq2_0 * GGML_RESTRICT y, int64_t k);
+GGML_API void quantize_row_tbq3_0_ref(const float * GGML_RESTRICT x, block_tbq3_0 * GGML_RESTRICT y, int64_t k);
+GGML_API void quantize_row_tbq4_0_ref(const float * GGML_RESTRICT x, block_tbq4_0 * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_tbq2_0(const block_tbq2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_tbq3_0(const block_tbq3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API size_t quantize_tbq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+GGML_API size_t quantize_tbq3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+GGML_API size_t quantize_tbq4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+GGML_API void quantize_row_tbq3_tcq_ref(const float * GGML_RESTRICT x, block_tbq3_tcq * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_tbq3_tcq(const block_tbq3_tcq * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API size_t quantize_tbq3_tcq(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+GGML_API void quantize_row_tbq2_tcq_ref(const float * GGML_RESTRICT x, block_tbq2_tcq * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_tbq2_tcq(const block_tbq2_tcq * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API size_t quantize_tbq2_tcq(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+GGML_API void quantize_row_tbq3_1s_ref(const float * GGML_RESTRICT x, block_tbq3_1s * GGML_RESTRICT y, int64_t k);
+GGML_API void quantize_row_tbq4_1s_ref(const float * GGML_RESTRICT x, block_tbq4_1s * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_tbq3_1s(const block_tbq3_1s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_tbq4_1s(const block_tbq4_1s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API size_t quantize_tbq3_1s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+GGML_API size_t quantize_tbq4_1s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+
+// Helper to check if a type is a TurboQuant KV cache type
+inline bool ggml_type_is_tbq_kv(enum ggml_type t) {
+    return t == GGML_TYPE_TBQ2_0 || t == GGML_TYPE_TBQ3_0 ||
+           t == GGML_TYPE_TBQ4_0 || t == GGML_TYPE_TBQ3_TCQ || t == GGML_TYPE_TBQ2_TCQ;
+}
 
 #ifdef __cplusplus
 }

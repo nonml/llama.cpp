@@ -429,7 +429,14 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_COUNT   = 42,
+        GGML_TYPE_TBQ3_0  = 42, // TurboQuant 3-bit KV cache: 2-bit PolarQuant + 1-bit QJL
+        GGML_TYPE_TBQ4_0  = 43, // TurboQuant 4-bit KV cache: 3-bit PolarQuant + 1-bit QJL
+        GGML_TYPE_TBQ2_0  = 44, // TurboQuant 2-bit KV cache: 2-bit PolarQuant, no QJL
+        GGML_TYPE_TBQ3_TCQ = 45, // TurboQuant 3-bit KV cache: TCQ (Trellis-Coded Quantization)
+        GGML_TYPE_TBQ2_TCQ = 46, // TurboQuant 2-bit KV cache: TCQ (k=2, L=8, 256 states)
+        GGML_TYPE_TBQ3_1S = 47, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
+        GGML_TYPE_TBQ4_1S = 48, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
+        GGML_TYPE_COUNT   = 49,
     };
 
     // precision
@@ -583,6 +590,8 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+
+        GGML_OP_TURBO_WHT,
 
         GGML_OP_COUNT,
     };
@@ -1316,6 +1325,19 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_geglu_quick_swapped(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
+
+    // Turbo Walsh-Hadamard Transform
+    // direction: GGML_TURBO_WHT_FORWARD = forward (signs1 -> WHT -> signs2)
+    //            GGML_TURBO_WHT_INVERSE = inverse (signs2 -> WHT -> signs1)
+    enum ggml_turbo_wht_direction {
+        GGML_TURBO_WHT_FORWARD = 0,
+        GGML_TURBO_WHT_INVERSE = 1,
+    };
+
+    GGML_API struct ggml_tensor * ggml_turbo_wht(
+            struct ggml_context *                 ctx,
+            struct ggml_tensor *                  a,
+            enum ggml_turbo_wht_direction         direction);
 
     // A: n columns, r rows,
     // B: n columns, r rows,

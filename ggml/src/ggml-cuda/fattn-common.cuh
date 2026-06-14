@@ -6,6 +6,62 @@
 
 #include <cstdint>
 
+// ============================================================
+// TurboQuant: per-compilation-unit centroid LUTs and calibration device symbols.
+// These live here (fattn-common.cuh) so both fattn-mma-f16.cuh and fattn-mma-turbo.cuh
+// can see them without depending on turbo-quant-cuda.cuh (which has its own copy for the
+// set_rows compilation unit).
+// ============================================================
+
+static __constant__ float d_turbo_centroids_2bit_fattn[4] = {
+    -0.133462f, -0.039994f, 0.039994f, 0.133462f
+};
+static __constant__ float d_turbo_centroids_3bit_fattn[8] = {
+    -0.190685f, -0.117832f, -0.065717f, -0.021460f,
+     0.021460f,  0.065717f,  0.117832f,  0.190685f
+};
+static __constant__ float d_turbo_centroids_4bit_fattn[16] = {
+    -0.241556f, -0.182907f, -0.143047f, -0.111065f,
+    -0.083317f, -0.058069f, -0.034311f, -0.011353f,
+     0.011353f,  0.034311f,  0.058069f,  0.083317f,
+     0.111065f,  0.143047f,  0.182907f,  0.241556f,
+};
+
+// FWHT rotation sign arrays (fattn compilation unit, same seed as turbo-quant-cuda.cuh).
+// Separate copies avoid cross-translation-unit __constant__ symbol collisions.
+static __constant__ float d_turbo_wht_signs1_fattn[128] = {
+    -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f
+};
+static __constant__ float d_turbo_wht_signs2_fattn[128] = {
+    1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f
+};
+
+// InnerQ: per-channel inverse scale for Q pre-rotation (fattn compilation unit).
+// Initialized to all 1.0 (identity). Updated by turbo_innerq_update_fattn_scales()
+// called from turbo-quant-cuda.cuh / fattn.cu.
+static __device__ float d_innerq_channel_scale_inv_fattn[128];
+
+// Q² calibration: accumulate per-position E[Q²] after FWHT rotation.
+// Used for product-aware TCQ codebook training.
+// Enabled by TURBO_Q_CALIBRATE=1 env var.
+static __device__ double d_q_channel_sq_fattn[128]; // sum of Q²ᵢ per position
+static __device__ int    d_q_channel_count_fattn;   // token count
+static __constant__ int  d_q_calibrate_fattn;       // 1 = accumulating (constant: fast broadcast read)
+
+// CAS-based double atomicAdd for portability (MSVC/CUDA 12.x lacks native overload)
+static __device__ __forceinline__ double atomicAdd_double(double * addr, double val) {
+    unsigned long long int * addr_ull = (unsigned long long int *)addr;
+    unsigned long long int old = *addr_ull, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(addr_ull, assumed,
+                        __double_as_longlong(__longlong_as_double(assumed) + val));
+    } while (assumed != old);
+    return __longlong_as_double(old);
+}
+
+// ============================================================
+
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
 #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.

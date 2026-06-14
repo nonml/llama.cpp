@@ -688,6 +688,13 @@ void ggml_compute_forward_add(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_TBQ2_0:
+        case GGML_TYPE_TBQ3_TCQ:
+        case GGML_TYPE_TBQ2_TCQ:
+        case GGML_TYPE_TBQ3_1S:
+        case GGML_TYPE_TBQ4_1S:
             {
                 ggml_compute_forward_add_q_f32(params, dst);
             } break;
@@ -10788,6 +10795,98 @@ void ggml_compute_forward_gated_delta_net(
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_gated_delta_net_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_turbo_wht
+
+// 128-wide Fast Walsh-Hadamard rotation used by the TBQ KV cache (signs1 -> FWHT -> signs2).
+// Sign arrays match the CUDA/Metal backends (seed=42 rotation); the normalized FWHT is an
+// involution, so the inverse direction simply swaps the order in which the sign arrays apply.
+static const float GGML_TURBO_WHT_SIGNS1[128] = {
+    -1.f, 1.f, 1.f,-1.f,-1.f, 1.f,-1.f, 1.f,-1.f,-1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f,
+     1.f,-1.f, 1.f,-1.f, 1.f,-1.f,-1.f, 1.f, 1.f, 1.f,-1.f, 1.f, 1.f,-1.f,-1.f,-1.f,
+    -1.f, 1.f, 1.f,-1.f, 1.f, 1.f,-1.f, 1.f,-1.f, 1.f, 1.f,-1.f,-1.f, 1.f,-1.f, 1.f,
+     1.f, 1.f, 1.f,-1.f,-1.f,-1.f,-1.f,-1.f, 1.f,-1.f, 1.f, 1.f, 1.f, 1.f,-1.f, 1.f,
+    -1.f,-1.f, 1.f,-1.f,-1.f,-1.f, 1.f,-1.f,-1.f,-1.f, 1.f,-1.f,-1.f,-1.f, 1.f, 1.f,
+     1.f,-1.f,-1.f, 1.f, 1.f, 1.f,-1.f,-1.f, 1.f, 1.f,-1.f, 1.f, 1.f,-1.f, 1.f,-1.f,
+    -1.f, 1.f, 1.f,-1.f, 1.f,-1.f, 1.f,-1.f, 1.f, 1.f, 1.f, 1.f,-1.f, 1.f,-1.f, 1.f,
+     1.f,-1.f, 1.f, 1.f,-1.f,-1.f,-1.f,-1.f,-1.f, 1.f, 1.f,-1.f, 1.f, 1.f,-1.f, 1.f,
+};
+static const float GGML_TURBO_WHT_SIGNS2[128] = {
+     1.f, 1.f, 1.f, 1.f,-1.f, 1.f, 1.f,-1.f, 1.f,-1.f,-1.f,-1.f, 1.f,-1.f,-1.f,-1.f,
+     1.f, 1.f,-1.f,-1.f, 1.f,-1.f, 1.f,-1.f, 1.f,-1.f,-1.f, 1.f,-1.f, 1.f, 1.f, 1.f,
+     1.f, 1.f,-1.f,-1.f,-1.f, 1.f,-1.f,-1.f,-1.f,-1.f,-1.f,-1.f, 1.f, 1.f, 1.f,-1.f,
+     1.f,-1.f, 1.f, 1.f, 1.f,-1.f,-1.f, 1.f,-1.f,-1.f,-1.f,-1.f,-1.f,-1.f, 1.f, 1.f,
+     1.f,-1.f, 1.f,-1.f,-1.f,-1.f,-1.f, 1.f,-1.f, 1.f,-1.f, 1.f,-1.f,-1.f, 1.f, 1.f,
+    -1.f, 1.f,-1.f, 1.f, 1.f,-1.f, 1.f,-1.f,-1.f,-1.f,-1.f, 1.f,-1.f,-1.f, 1.f,-1.f,
+     1.f,-1.f, 1.f, 1.f, 1.f,-1.f,-1.f, 1.f,-1.f, 1.f,-1.f, 1.f, 1.f,-1.f,-1.f, 1.f,
+    -1.f, 1.f,-1.f, 1.f, 1.f,-1.f, 1.f,-1.f, 1.f,-1.f,-1.f,-1.f,-1.f,-1.f, 1.f,-1.f,
+};
+
+static void ggml_compute_forward_turbo_wht_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(src0->ne[0] % 128 == 0);
+
+    const int direction = ggml_get_op_params_i32(dst, 0);
+    const float * s_first  = direction == GGML_TURBO_WHT_INVERSE ? GGML_TURBO_WHT_SIGNS2 : GGML_TURBO_WHT_SIGNS1;
+    const float * s_second = direction == GGML_TURBO_WHT_INVERSE ? GGML_TURBO_WHT_SIGNS1 : GGML_TURBO_WHT_SIGNS2;
+
+    const float inv_sqrt_128 = 0.08838834764831845f; // 1/sqrt(128)
+
+    const int64_t n_groups = ggml_nelements(src0) / 128;
+
+    // distribute 128-element groups across threads
+    const int64_t dr  = (n_groups + params->nth - 1) / params->nth;
+    const int64_t g0  = dr * params->ith;
+    const int64_t g1  = MIN(g0 + dr, n_groups);
+
+    const float * src_data = (const float *) src0->data;
+    float       * dst_data = (float       *) dst->data;
+
+    for (int64_t g = g0; g < g1; g++) {
+        float buf[128];
+        const float * x = src_data + g * 128;
+        for (int i = 0; i < 128; i++) {
+            buf[i] = x[i] * s_first[i];
+        }
+        for (int h = 1; h < 128; h *= 2) {
+            for (int i = 0; i < 128; i += h * 2) {
+                for (int j = i; j < i + h; j++) {
+                    const float a = buf[j];
+                    const float b = buf[j + h];
+                    buf[j]     = a + b;
+                    buf[j + h] = a - b;
+                }
+            }
+        }
+        float * y = dst_data + g * 128;
+        for (int i = 0; i < 128; i++) {
+            y[i] = buf[i] * inv_sqrt_128 * s_second[i];
+        }
+    }
+}
+
+void ggml_compute_forward_turbo_wht(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_turbo_wht_f32(params, dst);
             } break;
         default:
             {

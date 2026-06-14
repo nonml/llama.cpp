@@ -2359,6 +2359,13 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
+    // TBQ V un-rotation: V is stored in FWHT-rotated space, so the attention output
+    // softmax(QK^T)·V_rot is also rotated. Apply inverse WHT to recover original space.
+    if ((v->type == GGML_TYPE_TBQ3_0 || v->type == GGML_TYPE_TBQ4_0) && cur->ne[0] % 128 == 0) {
+        cur = ggml_cont(ctx0, cur);
+        cur = ggml_turbo_wht(ctx0, cur, GGML_TURBO_WHT_INVERSE);
+    }
+
     if (inp->self_v_rot) {
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
     }
@@ -2613,6 +2620,13 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
+
+    // TBQ V un-rotation: V is stored in FWHT-rotated space, so the attention output
+    // softmax(QK^T)·V_rot is also rotated. Apply inverse WHT to recover original space.
+    if ((v->type == GGML_TYPE_TBQ3_0 || v->type == GGML_TYPE_TBQ4_0) && cur->ne[0] % 128 == 0) {
+        cur = ggml_cont(ctx0, cur);
+        cur = ggml_turbo_wht(ctx0, cur, GGML_TURBO_WHT_INVERSE);
+    }
 
     if (v_rot) {
         cur = ggml_mul_mat_aux(ctx0, cur, v_rot);
