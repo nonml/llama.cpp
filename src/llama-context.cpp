@@ -1221,27 +1221,65 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
-    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        static bool warned = false;
-        if (!warned) {
-            LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
-            warned = true;
-        }
-        if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
-        }
-        sampling.samplers.erase(seq_id);
-        return false;
-    }
-
     const bool can_offload =
         sampler &&
         sampler->iface->backend_init &&
         sampler->iface->backend_apply &&
         llama_sampler_chain_n(sampler) > 0;
 
-    if (sampler && can_offload) {
-        auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
+    if (can_offload) {
+        ggml_backend_dev_t dev_output = model.dev_output();
+        const bool is_meta = ggml_backend_dev_is_meta(dev_output);
+
+        ggml_backend_buffer_type_t buft        = nullptr;
+        ggml_backend_dev_t         sampler_dev = nullptr; // simple device for the executor; nullptr -> CPU
+
+        if (is_meta) {
+            // For tensor split mode, the output device is a meta device and the logits are
+            // split across GPUs. The sampling graph is computed separately on a single backend
+            // (see sample_separate), so pick the first simple device that supports all sampler ops.
+            const size_t n_devs = ggml_backend_meta_dev_n_devs(dev_output);
+            for (size_t i = 0; i < n_devs; i++) {
+                ggml_backend_dev_t simple_dev = ggml_backend_meta_dev_simple_dev(dev_output, i);
+                ggml_backend_buffer_type_t simple_buft = ggml_backend_dev_buffer_type(simple_dev);
+                if (llama_sampler_backend_support(sampler, simple_buft, false)) {
+                    buft        = simple_buft;
+                    sampler_dev = simple_dev;
+                    LLAMA_LOG_DEBUG("%s: tensor split mode - routing backend sampler to device %zu (%s)\n",
+                        __func__, i, ggml_backend_dev_name(simple_dev));
+                    break;
+                }
+            }
+            if (!buft) {
+                LLAMA_LOG_WARN("%s: no device in meta backend supports all sampling ops, falling back to CPU\n", __func__);
+                buft        = ggml_backend_cpu_buffer_type();
+                sampler_dev = nullptr; // CPU
+            }
+        } else {
+            buft = ggml_backend_dev_buffer_type(dev_output);
+        }
+
+        sampling.sampler_buft = buft;
+
+        // for the meta (tensor split) path, set up the standalone sampler executor backend
+        if (is_meta) {
+            auto & exec = sampling.exec;
+            if (exec.buft != buft) {
+                exec.backend.reset(sampler_dev ? ggml_backend_dev_init(sampler_dev, nullptr)
+                                               : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+                if (!exec.backend) {
+                    LLAMA_LOG_ERROR("%s: failed to initialize backend sampling executor\n", __func__);
+                    sampling.samplers.erase(seq_id);
+                    sampling.sampler_buft = nullptr;
+                    return false;
+                }
+                exec.galloc.reset(ggml_gallocr_new(buft));
+                exec.buft = buft;
+            }
+            // the sampler set just changed -> force a rebuild of the sampler graph
+            exec.gf = nullptr;
+            exec.ctx.reset();
+        }
 
         sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
 
@@ -1260,11 +1298,13 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         }
 
         sampling.samplers.erase(seq_id);
+        sampling.sampler_buft = nullptr;
 
         return false;
     }
 
     sampling.samplers.erase(seq_id);
+    sampling.sampler_buft = nullptr;
 
     sched_need_reserve = true;
 
@@ -1595,7 +1635,8 @@ static void copy_tensor_async_rows(
     size_t stride,
     uint32_t row_offset,
     ggml_backend_sched_t sched,
-    std::vector<uint32_t> * counts = nullptr) {
+    std::vector<uint32_t> * counts = nullptr,
+    ggml_backend_t backend_override = nullptr) {
     if (!dst.has_data()) {
         return;
     }
@@ -1612,7 +1653,7 @@ static void copy_tensor_async_rows(
         GGML_ASSERT(n_elements <= stride);
         GGML_ASSERT((size_t) row * stride + n_elements <= dst.size);
 
-        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
+        ggml_backend_t backend = backend_override ? backend_override : ggml_backend_sched_get_tensor_backend(sched, tensor);
         T * row_ptr = dst.data + (size_t) row * stride;
         ggml_backend_tensor_get_async(backend, tensor, row_ptr, 0, ggml_nbytes(tensor));
 
@@ -1621,6 +1662,22 @@ static void copy_tensor_async_rows(
             (*counts)[row] = n_elements;
         }
     }
+}
+
+// map each output row of a ubatch to the sequence it belongs to, mirroring the row order of
+//     llm_graph_result::t_sampled etc. so that both sampling paths index their outputs the same way
+static std::map<llama_seq_id, std::vector<uint32_t>> build_sampling_rows(const llama_ubatch & ubatch) {
+    std::map<llama_seq_id, std::vector<uint32_t>> sampling_rows;
+
+    uint32_t local = 0;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (!ubatch.output[i]) {
+            continue;
+        }
+        sampling_rows[ubatch.seq_id[i][0]].push_back(local++);
+    }
+
+    return sampling_rows;
 }
 
 static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers) {
@@ -1638,6 +1695,171 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
         }
     }
     return false; // all sequences use backend sampling
+}
+
+bool llama_context::build_sampler_graph(const llama_ubatch & ubatch, int64_t n_outputs) {
+    auto & exec = sampling.exec;
+
+    GGML_ASSERT(exec.backend && "sampler executor backend not initialized");
+
+    const int64_t n_vocab = model.vocab.n_tokens();
+
+    // seq -> local output rows within this ubatch (a sequence can have several output rows,
+    //     e.g. when verifying speculative drafts - every one of them has to be sampled)
+    const auto sampling_rows = build_sampling_rows(ubatch);
+
+    // active = samplers configured for a seq that has an output in this ubatch
+    std::vector<std::pair<llama_seq_id, llama_sampler *>> active;
+    active.reserve(sampling_rows.size());
+    for (const auto & [seq_id, rows] : sampling_rows) {
+        GGML_UNUSED(rows);
+        auto it = sampling.samplers.find(seq_id);
+        if (it != sampling.samplers.end()) {
+            active.emplace_back(seq_id, it->second);
+        }
+    }
+
+    exec.t_sampled.clear();
+    exec.t_sampled_probs.clear();
+    exec.t_sampled_logits.clear();
+    exec.t_candidates.clear();
+    exec.gf = nullptr;
+
+    if (active.empty()) {
+        return false;
+    }
+
+    // the standalone sampler graph is tiny and the active layout can change every step,
+    // so rebuild it each decode rather than tracking reuse
+    const size_t n_nodes = n_outputs * 512 + 16;
+    ggml_init_params params = {
+        /*.mem_size   =*/ n_nodes * ggml_tensor_overhead() + ggml_graph_overhead_custom(n_nodes, false),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    // the previous sampler context is freed here, so any tensor the samplers kept a pointer to
+    //     (e.g. the dist sampler's uniform inputs) is now dangling - drop it before rebuilding,
+    //     same as the inline path does in llm_graph_context::build_sampling
+    for (const auto & entry : sampling.samplers) {
+        if (entry.second->iface->backend_reset) {
+            entry.second->iface->backend_reset(entry.second);
+        }
+    }
+
+    exec.ctx.reset(ggml_init(params));
+    GGML_ASSERT(exec.ctx && "failed to create sampler graph context");
+
+    ggml_context * ctx = exec.ctx.get();
+
+    exec.gf      = ggml_new_graph_custom(ctx, n_nodes, false);
+    exec.n_vocab = n_vocab;
+    exec.n_rows  = n_outputs;
+
+    exec.logits_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_vocab, n_outputs);
+    ggml_set_name (exec.logits_in, "sampler_logits");
+    ggml_set_input(exec.logits_in);
+
+    // indexed by local output row, same layout as llm_graph_result::t_*
+    exec.t_sampled       .resize(n_outputs, nullptr);
+    exec.t_sampled_probs .resize(n_outputs, nullptr);
+    exec.t_sampled_logits.resize(n_outputs, nullptr);
+    exec.t_candidates    .resize(n_outputs, nullptr);
+
+    bool any_output = false;
+
+    for (const auto & [seq_id, sampler] : active) {
+        const auto & rows = sampling_rows.at(seq_id);
+
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const uint32_t row = rows[i];
+            GGML_ASSERT(row < (uint32_t) n_outputs);
+
+            ggml_tensor * logits_seq = ggml_view_1d(ctx, exec.logits_in, n_vocab, row * exec.logits_in->nb[1]);
+            ggml_format_name(logits_seq, "logits_seq_%d_%zu", seq_id, i);
+
+            struct llama_sampler_data data = {
+                /*.logits      =*/ logits_seq,
+                /*.probs       =*/ nullptr,
+                /*.sampled     =*/ nullptr,
+                /*.candidates  =*/ nullptr,
+            };
+
+            sampler->iface->backend_apply(sampler, ctx, exec.gf, &data);
+
+            const auto add_output = [&](ggml_tensor * t, std::vector<ggml_tensor *> & dst) {
+                if (t == nullptr) {
+                    return;
+                }
+                dst[row] = t;
+                ggml_set_output(t);
+                ggml_build_forward_expand(exec.gf, t);
+                any_output = true;
+            };
+
+            add_output(data.sampled,    exec.t_sampled);
+            add_output(data.probs,      exec.t_sampled_probs);
+            add_output(data.logits,     exec.t_sampled_logits);
+            add_output(data.candidates, exec.t_candidates);
+        }
+    }
+
+    return any_output;
+}
+
+void llama_context::sample_separate(const llm_graph_result * res, const llama_ubatch & ubatch, int64_t n_outputs_prev) {
+    auto & exec = sampling.exec;
+
+    ggml_tensor * t_logits = res->get_logits();
+    if (!t_logits || n_outputs == 0 || !exec.backend || !exec.galloc) {
+        return;
+    }
+
+    const int64_t n_vocab = model.vocab.n_tokens();
+
+    if (!build_sampler_graph(ubatch, n_outputs)) {
+        return;
+    }
+
+    if (!ggml_gallocr_alloc_graph(exec.galloc.get(), exec.gf)) {
+        LLAMA_LOG_ERROR("%s: failed to allocate sampler graph\n", __func__);
+        return;
+    }
+
+    // make sure the model graph that produced t_logits has finished before reading it
+    ggml_backend_sched_synchronize(sched.get());
+
+    // gather the full (vocab-split) logits to host via the meta backend, then upload to the single sampler backend
+    if ((int64_t) exec.host_logits.size() < n_outputs*n_vocab) {
+        exec.host_logits.resize(n_outputs*n_vocab);
+    }
+    ggml_backend_tensor_get(t_logits,       exec.host_logits.data(), 0, n_outputs*n_vocab*sizeof(float));
+    ggml_backend_tensor_set(exec.logits_in, exec.host_logits.data(), 0, n_outputs*n_vocab*sizeof(float));
+
+    // set sampler inputs (e.g. dist RNG) now that the graph is allocated
+    for (const auto & [seq_id, rows] : build_sampling_rows(ubatch)) {
+        GGML_UNUSED(rows);
+        auto it = sampling.samplers.find(seq_id);
+        if (it != sampling.samplers.end() && it->second->iface->backend_set_input) {
+            it->second->iface->backend_set_input(it->second);
+        }
+    }
+
+    if (ggml_backend_graph_compute(exec.backend.get(), exec.gf) != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: sampler graph compute failed\n", __func__);
+        return;
+    }
+
+    // read the results back into the host sampling buffers at the global output rows
+    // (same helper as the inline path, but reading directly from the sampler backend)
+    const auto stride  = n_vocab;
+    const auto backend = exec.backend.get();
+
+    copy_tensor_async_rows(exec.t_sampled,        sampling.sampled,    1,      n_outputs_prev, nullptr, nullptr,                     backend);
+    copy_tensor_async_rows(exec.t_sampled_logits, sampling.logits,     stride, n_outputs_prev, nullptr, &sampling.logits_count,      backend);
+    copy_tensor_async_rows(exec.t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, nullptr, &sampling.probs_count,       backend);
+    copy_tensor_async_rows(exec.t_candidates,     sampling.candidates, stride, n_outputs_prev, nullptr, &sampling.candidates_count,  backend);
+
+    ggml_backend_synchronize(exec.backend.get());
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
@@ -1963,7 +2185,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        if (has_samplers) {
+        // Copy backend sampling output if this ubatch produced any sampling tensors.
+        if (has_samplers && sampling.sampler_buft != nullptr && ggml_backend_dev_is_meta(model.dev_output())) {
+            // tensor split: the sampling graph runs separately on a single backend (sampling.exec)
+            sample_separate(res, ubatch, n_outputs_prev);
+        } else if (has_samplers) {
             const auto stride = n_vocab;
 
             // async copy the sampling data from the backend to the host
@@ -2482,6 +2708,8 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.sampler_buft =*/ sampling.sampler_buft,
+        /*.sampling_separate =*/ sampling.sampler_buft != nullptr && ggml_backend_dev_is_meta(model.dev_output()),
     };
 }
 

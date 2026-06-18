@@ -6,6 +6,15 @@
 
 struct llama_vocab;
 struct llama_grammar;
+struct ggml_backend_buffer_type;
+
+// check if all ggml ops used by the sampler are supported by the backend
+// probe chains with with_candidates = false: the runtime data flow starts without
+// candidates, and top-k turns a pre-seeded 1D candidates tensor into a 2D one
+bool llama_sampler_backend_support(
+        llama_sampler              * smpl,
+        ggml_backend_buffer_type_t   buft,
+        bool                         with_candidates = true);
 
 // sampler chain
 

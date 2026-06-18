@@ -1489,6 +1489,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
+    sampler_buft     (params.sampler_buft),
+    sampling_separate(params.sampling_separate),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -3710,6 +3712,12 @@ void llm_graph_context::build_pooling(
 
 void llm_graph_context::build_sampling() const {
     if (samplers.empty() || !res->t_logits) {
+        return;
+    }
+
+    // for a meta (tensor split) output device the sampling graph is computed separately
+    // on a single backend (llama_context::sample_separate), not appended to the model graph
+    if (sampling_separate) {
         return;
     }
 

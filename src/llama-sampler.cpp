@@ -635,16 +635,17 @@ static uint32_t llama_sampler_backend_probe_n_nodes(const llama_sampler_backend_
 }
 
 // check if all ggml ops used by the sampler are supported by the backend
-static bool llama_sampler_backend_support(
+bool llama_sampler_backend_support(
         llama_sampler              * smpl,
-        ggml_backend_buffer_type_t   buft) {
+        ggml_backend_buffer_type_t   buft,
+        bool                         with_candidates) {
     auto * device = ggml_backend_buft_get_device(buft);
     if (!device) {
         // CPU backend always supported
         return true;
     }
 
-    auto probe = llama_sampler_backend_probe_graph(smpl, 1024*1024, GGML_DEFAULT_GRAPH_SIZE, true);
+    auto probe = llama_sampler_backend_probe_graph(smpl, 1024*1024, GGML_DEFAULT_GRAPH_SIZE, with_candidates);
 
     for (int i = 0; i < ggml_graph_n_nodes(probe.gf); i++) {
         struct ggml_tensor * op = ggml_graph_node(probe.gf, i);
@@ -795,7 +796,16 @@ static void llama_sampler_chain_backend_apply(
           struct llama_sampler_data * data) {
     auto * chain = (llama_sampler_chain *) smpl->ctx;
 
-    GGML_ASSERT(chain->is_init && "llama_sampler_chain_backend_init() not called");
+    // When not initialized (e.g., during llama_sampler_backend_support check),
+    // build graph for all samplers in the chain
+    if (!chain->is_init) {
+        for (auto & smpl : chain->samplers) {
+            if (smpl.ptr->iface->backend_apply) {
+                smpl.ptr->iface->backend_apply(smpl.ptr, ctx, gf, data);
+            }
+        }
+        return;
+    }
 
     for (auto & smpl : chain->samplers) {
         if (!smpl.is_backend) {

@@ -1144,6 +1144,11 @@ static bool ggml_backend_cuda_comm_try_allreduce_butterfly(
     return false;
 }
 
+static bool ggml_backend_cuda_comm_is_fatal(void * comm_ctx_v) {
+    GGML_UNUSED(comm_ctx_v);
+    return ggml_cuda_ar_unrepaired_stall();
+}
+
 static void ggml_backend_cuda_comm_free(void * comm_ctx_v) {
     if (comm_ctx_v == nullptr) {
         return;
@@ -4245,6 +4250,10 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 #endif // USE_CUDA_GRAPH
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    if (ggml_cuda_ar_unrepaired_stall()) {
+        return GGML_STATUS_FAILED;
+    }
+
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
@@ -5482,6 +5491,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_is_fatal") == 0) {
+        return (void *)ggml_backend_cuda_comm_is_fatal;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;

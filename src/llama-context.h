@@ -234,6 +234,13 @@ private:
     // from backend into host-side embd_layer_inp buffers
     void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
 
+    // backend sampling for a meta (tensor split) output device: gather the full logits to host,
+    // run the sampling graph on a single backend (sampling.exec), and write the sampling.* buffers
+    void sample_separate(const llm_graph_result * res, const llama_ubatch & ubatch, int64_t n_outputs_prev);
+
+    // (re)build sampling.exec.gf for the active samplers of this ubatch; returns false if there is nothing to sample
+    bool build_sampler_graph(const llama_ubatch & ubatch, int64_t n_outputs);
+
     //
     // graph
     //
@@ -307,6 +314,39 @@ private:
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
+
+        // buffer type used for backend sampling
+        // for tensor split mode, this is a single-GPU buft (not the meta buft)
+        // for other modes, this is the output device's buft
+        ggml_backend_buffer_type_t sampler_buft = nullptr;
+
+        // standalone executor for running the sampling graph on a single backend,
+        // outside the meta scheduler (used when the model output device is a meta device)
+        struct sampler_exec {
+            ggml_backend_ptr           backend;            // owned single-GPU (or CPU) backend behind buft
+            ggml_backend_buffer_type_t buft = nullptr;     // == sampler_buft the backend was created for
+
+            ggml_context_ptr ctx;                          // no_alloc ctx holding the sampler graph
+            ggml_gallocr_ptr galloc;                       // allocator over `backend`'s buffer type
+            ggml_cgraph *    gf = nullptr;
+
+            ggml_tensor * logits_in = nullptr;             // [n_vocab, n_rows] input, allocated by galloc
+            int64_t       n_rows  = 0;                      // rows the graph was built for (== n_outputs_max)
+            int64_t       n_vocab = 0;
+
+            // per-output-row tensors produced by backend_apply (mirror llm_graph_result::t_*)
+            std::vector<ggml_tensor *> t_sampled;
+            std::vector<ggml_tensor *> t_sampled_probs;
+            std::vector<ggml_tensor *> t_sampled_logits;
+            std::vector<ggml_tensor *> t_candidates;
+
+            // sampler set the graph was built with (rebuild trigger)
+            std::map<llama_seq_id, llama_sampler *> built_for;
+
+            // host scratch holding the full gathered logits ([n_vocab * n_rows])
+            std::vector<float> host_logits;
+        };
+        sampler_exec exec;
 
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};

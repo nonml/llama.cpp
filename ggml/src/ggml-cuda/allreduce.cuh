@@ -27,3 +27,7 @@ bool ggml_cuda_ar_allreduce(
     ggml_backend_t        * backends,
     ggml_tensor           ** tensors);
 
+// True after an unrepaired in-kernel rendezvous stall. The meta backend must
+// fail the graph; returning false from allreduce would run the butterfly path.
+bool ggml_cuda_ar_unrepaired_stall(void);
+
