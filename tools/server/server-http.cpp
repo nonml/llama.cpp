@@ -5,11 +5,76 @@
 
 #include <cpp-httplib/httplib.h>
 
+#include <chrono>
 #include <functional>
 #include <future>
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
+
+#if defined(_WIN32)
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  include <iphlpapi.h>
+#  ifdef _MSC_VER
+#    pragma comment(lib, "iphlpapi.lib")
+#  endif
+#elif defined(__unix__) || defined(__APPLE__)
+#  include <csignal>
+#  include <cstdio>
+#  include <cstdlib>
+#endif
+
+// kill any process listening on the given port; returns true if at least one process was signaled
+static bool port_eject_impl(int target_port) {
+#if defined(_WIN32)
+    ULONG size = 0;
+    GetTcpTable2(nullptr, &size, FALSE);
+    std::vector<BYTE> buf(size);
+    auto * table = reinterpret_cast<PMIB_TCPTABLE2>(buf.data());
+    if (GetTcpTable2(table, &size, FALSE) != NO_ERROR) {
+        return false;
+    }
+    bool killed = false;
+    for (DWORD i = 0; i < table->dwNumEntries; i++) {
+        const auto & row = table->table[i];
+        DWORD row_port = ntohs(static_cast<u_short>(row.dwLocalPort));
+        if (row_port == static_cast<DWORD>(target_port)) {
+            HANDLE proc = OpenProcess(PROCESS_TERMINATE, FALSE, row.dwOwningPid);
+            if (proc) {
+                SRV_INF("port-eject: terminating PID %lu holding port %d\n", (unsigned long)row.dwOwningPid, target_port);
+                TerminateProcess(proc, 1);
+                CloseHandle(proc);
+                killed = true;
+            }
+        }
+    }
+    return killed;
+#elif defined(__unix__) || defined(__APPLE__)
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "lsof -ti :%d 2>/dev/null", target_port);
+    FILE * fp = popen(cmd, "r");
+    if (!fp) {
+        return false;
+    }
+    bool killed = false;
+    char line[32];
+    while (fgets(line, sizeof(line), fp)) {
+        pid_t pid = static_cast<pid_t>(std::atoi(line));
+        if (pid > 0) {
+            SRV_INF("port-eject: sending SIGTERM to PID %d holding port %d\n", pid, target_port);
+            kill(pid, SIGTERM);
+            killed = true;
+        }
+    }
+    pclose(fp);
+    return killed;
+#else
+    (void)target_port;
+    return false;
+#endif
+}
 
 //
 // HTTP implementation using cpp-httplib
@@ -78,8 +143,9 @@ bool server_http_context::init(const common_params & params) {
     const gcp_params gcp;
 
     path_prefix = params.api_prefix;
-    port = params.port;
-    hostname = params.hostname;
+    port        = params.port;
+    hostname    = params.hostname;
+    port_eject  = params.port_eject;
 
     if (gcp.enabled) {
         SRV_INF("Google Cloud Platform compat: health route = %s, predict route = %s, port = %d\n", gcp.path_health.c_str(), gcp.path_predict.c_str(), gcp.port);
@@ -426,6 +492,14 @@ bool server_http_context::start() {
                 port = bound_port;
             }
         } else {
+            was_bound = srv->bind_to_port(hostname, port);
+        }
+    }
+
+    if (!was_bound && port_eject && !is_sock && port != 0) {
+        SRV_WRN("port-eject: port %d is in use, attempting to eject...\n", port);
+        if (port_eject_impl(port)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
             was_bound = srv->bind_to_port(hostname, port);
         }
     }
