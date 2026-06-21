@@ -72,5 +72,11 @@ private:
     // no-op if output file is not set
     void write_output_file(const std::string & content);
 
+    // create a checkpoint at the current position, returns position or -1 on error
+    int32_t checkpoint();
+
+    // rollback to a specific token position
+    bool rollback(int32_t pos);
+
     std::unique_ptr<cli_context_impl> impl;
 };

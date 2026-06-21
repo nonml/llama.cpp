@@ -25,6 +25,9 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
+    SERVER_TASK_TYPE_SLOT_CHECKPOINT,
+    SERVER_TASK_TYPE_SLOT_ROLLBACK,
+    SERVER_TASK_TYPE_SLOT_FORK,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
 };
@@ -168,6 +171,22 @@ struct server_task {
         std::string filepath;
     };
     slot_action slot_action;
+
+    // used by SERVER_TASK_TYPE_SLOT_CHECKPOINT
+    std::string checkpoint_name;
+
+    // used by SERVER_TASK_TYPE_SLOT_ROLLBACK
+    int checkpoint_pos = -1; // token position to rollback to
+    int generation_id = -1;  // must match slot's current generation
+
+    // used by SERVER_TASK_TYPE_SLOT_FORK
+    struct slot_fork_action {
+        int src_slot;
+        int dst_slot;
+        int p0 = 0;
+        int p1 = -1; // -1 = end of sequence
+    };
+    slot_fork_action slot_fork_action;
 
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
@@ -331,6 +350,10 @@ struct server_task_result_cmpl_final : server_task_result {
     int32_t n_prompt_tokens;
     int32_t n_prompt_tokens_cache;
     int32_t n_tokens_cached;
+    int32_t checkpoint_pos = -1; // auto-checkpoint before this task
+    int32_t generation_id = -1;  // slot generation for safe rollback
+    int32_t n_ctx_slot = 0;      // slot context size (for watermark)
+    double fill_pct = 0.0;       // context fill percentage
     bool has_new_line;
     std::string stopping_word;
     stop_type stop = STOP_TYPE_NONE;
@@ -548,6 +571,33 @@ struct server_task_result_control : server_task_result {
     }
 };
 
+struct server_task_result_slot_checkpoint : server_task_result {
+    int id_slot;
+    std::string name;
+    int32_t pos;
+    int32_t generation_id; // to prevent stale rollback after slot recycling
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_slot_rollback : server_task_result {
+    int id_slot;
+    int32_t from_pos;
+    int32_t to_pos;
+    int32_t n_removed;
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_slot_fork : server_task_result {
+    int src_slot;
+    int dst_slot;
+    int32_t p0;
+    int32_t p1;
+
+    virtual json to_json() override;
+};
+
 struct server_task_result_get_lora : server_task_result {
     struct lora {
         common_adapter_lora_info info;
@@ -567,6 +617,9 @@ struct server_prompt {
     server_tokens tokens;
 
     std::list<common_prompt_checkpoint> checkpoints;
+
+    // second-chance score for cache eviction, 1 = fresh/decayed, higher = more retained
+    uint8_t score = 1;
 
     void clear() {
         tokens.clear();
@@ -598,6 +651,9 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // second-chance score for cache eviction, 1 = fresh/decayed, higher = more retained
+    uint8_t score = 1;
+
     size_t size() const {
         size_t res = data.size();
 
@@ -622,6 +678,13 @@ struct server_prompt_cache {
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    // recurrent/hybrid models: their sequence state can only be restored as a WHOLE and never
+    // partially truncated by position. In this mode a cached entry is reusable only when its
+    // tokens are a full prefix of the incoming prompt (so we restore it and decode just the
+    // delta - no partial seq_rm, which these models can't do). Whole-sequence (de)serialization
+    // itself already works for them; it's the position-range trimming that doesn't.
+    bool whole_seq_only = false;
 
     size_t size() const;
 

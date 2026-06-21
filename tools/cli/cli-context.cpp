@@ -20,6 +20,7 @@ using json = common_json;
 struct cli_context_impl {
     json messages      = json::array();
     json pending_media = json::array(); // staged multimodal content parts
+    int32_t last_generation_id = -1;    // slot generation for safe rollback
 };
 
 cli_context::cli_context(const common_params & params) : params(params), impl(new cli_context_impl()) {}
@@ -442,6 +443,8 @@ int cli_context::run() {
     banner += "  /exit or Ctrl+C     stop or exit\n";
     banner += "  /regen              regenerate the last response\n";
     banner += "  /clear              clear the chat history\n";
+    banner += "  /checkpoint         save current position for rollback\n";
+    banner += "  /rollback <pos>     rollback to token position\n";
     banner += "  /read <file>        add a text file\n";
     banner += "  /glob <pattern>     add text files using globbing pattern\n";
     if (has_vision) {
@@ -532,6 +535,35 @@ int cli_context::run() {
 
             impl->pending_media = json::array();
             ui::show_message("Chat history cleared.");
+            continue;
+        } else if (string_starts_with(buffer, "/checkpoint")) {
+            int32_t pos = checkpoint();
+            if (pos < 0) {
+                ui::show_error("Failed to create checkpoint.");
+            } else {
+                ui::show_message(string_format("Checkpoint at position %d.", pos));
+            }
+            continue;
+        } else if (string_starts_with(buffer, "/rollback ")) {
+            std::string arg = string_strip(buffer.substr(10));
+            int32_t pos;
+            try {
+                pos = std::stoi(arg);
+            } catch (...) {
+                ui::show_error("Usage: /rollback <position>");
+                continue;
+            }
+            if (pos < 0) {
+                ui::show_error("Position must be non-negative.");
+                continue;
+            }
+            if (rollback(pos)) {
+                ui::show_message(string_format("Rolled back to position %d.", pos));
+                impl->messages.clear();
+                add_system_prompt();
+            } else {
+                ui::show_error(string_format("Failed to rollback to position %d.", pos));
+            }
             continue;
         } else if (
                 (string_starts_with(buffer, "/image ") && has_vision) ||
@@ -663,6 +695,34 @@ int cli_context::run() {
     ui::show_message("\n\nExiting...");
 
     return 0;
+}
+
+int32_t cli_context::checkpoint() {
+    try {
+        std::string body = json{{"name", ""}}.dump();
+        std::string resp = client.post("/slots/0?action=checkpoint", body);
+        json result = json::parse(resp);
+        impl->last_generation_id = result.value("generation_id", -1);
+        return result.value("pos", -1);
+    } catch (const std::exception & e) {
+        ui::show_error(string_format("checkpoint failed: %s", e.what()));
+        return -1;
+    }
+}
+
+bool cli_context::rollback(int32_t pos) {
+    try {
+        json body = {
+            {"pos", pos},
+            {"generation_id", impl->last_generation_id},
+        };
+        std::string resp = client.post("/slots/0?action=rollback", body.dump());
+        json result = json::parse(resp);
+        return !result.contains("error");
+    } catch (const std::exception & e) {
+        ui::show_error(string_format("rollback failed: %s", e.what()));
+        return false;
+    }
 }
 
 void cli_context::shutdown() {

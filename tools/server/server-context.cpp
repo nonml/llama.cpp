@@ -337,6 +337,7 @@ struct server_slot {
         mem.seq_rm(id, -1, -1);
 
         prompt.clear();
+        prompt.score = 1;
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -366,6 +367,12 @@ struct server_slot {
     int64_t t_print_last = 0;
     int32_t n_gen_last = 0;
 
+    // Auto-checkpoint: position before this task started
+    int32_t checkpoint_pos = -1;
+
+    // Generation counter: increments on reset to prevent stale rollback
+    int32_t generation_id = 0;
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -387,6 +394,12 @@ struct server_slot {
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
+
+        // clear auto-checkpoint
+        checkpoint_pos = -1;
+
+        // increment generation counter on reset
+        generation_id++;
 
         task_prev = std::move(task);
         task.reset();
@@ -1355,8 +1368,15 @@ private:
                 SRV_TRC("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
+            // A cached entry is reusable only when its tokens are a full prefix of
+            // the new prompt, so we restore it and decode just the delta - no partial seq_rm needed.
+            bool tgt_recurrent_or_hybrid = model_tgt && (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt));
+            if (tgt_recurrent_or_hybrid) {
+                SRV_WRN("%s", "recurrent/hybrid target: prompt cache runs in whole-sequence prefix-only mode\n");
+            }
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache->whole_seq_only = tgt_recurrent_or_hybrid;
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -2105,6 +2125,10 @@ private:
         res->n_prompt_tokens       = slot.task->n_tokens();
         res->n_prompt_tokens_cache = slot.stats.n_prompt_cached;
         res->n_tokens_cached       = slot.prompt.n_tokens();
+        res->checkpoint_pos        = slot.checkpoint_pos;
+        res->generation_id         = slot.generation_id;
+        res->n_ctx_slot            = slot.n_ctx;
+        res->fill_pct              = slot.n_ctx > 0 ? (double)slot.prompt.n_tokens() / slot.n_ctx * 100.0 : 0.0;
         res->has_new_line          = slot.has_new_line;
         res->stopping_word         = slot.stopping_word;
         res->stop                  = slot.stop;
@@ -2388,6 +2412,27 @@ private:
                         break;
                     }
 
+                    // Pinned-slot prompt-cache swap. get_available_slot() runs the cache
+                    // stash/restore, but an explicit id_slot bypasses it. If a pinned slot was
+                    // repurposed (e.g. a side-session ran on it), its prefix is a poor match for
+                    // this prompt and we would reprocess from scratch. Stash the current state
+                    // and restore the best cached match so a returning conversation is a cache
+                    // hit. Guarded by prefix similarity, so the common case (the same growing
+                    // conversation on a pinned slot) is left untouched.
+                    if (task.id_slot != -1 && prompt_cache && !task.is_parent()) {
+                        const auto & cur = slot->prompt.tokens;
+                        const size_t n_in = task.tokens.size();
+                        const float sim = (cur.empty() || n_in == 0) ? 0.0f
+                                        : (float) cur.get_common_prefix(task.tokens) / (float) n_in;
+                        if (sim < 0.5f) {
+                            if (cur.size() > 0) {
+                                slot->prompt_save(*prompt_cache);
+                            }
+                            slot->prompt_load(*prompt_cache, task.tokens);
+                            prompt_cache->update();
+                        }
+                    }
+
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks
                         size_t n_child_tasks = task.child_tasks.size();
@@ -2654,6 +2699,149 @@ private:
                     res->id       = task.id;
                     res->id_slot  = id_slot;
                     res->n_erased = n_erased;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_CHECKPOINT:
+                {
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->prompt.tokens.has_mtmd) {
+                        send_error(task, "checkpoint is not supported with multimodal content", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+
+                    auto res = std::make_unique<server_task_result_slot_checkpoint>();
+                    res->id      = task.id;
+                    res->id_slot = id_slot;
+                    res->name          = task.checkpoint_name;
+                    res->pos           = (int32_t) slot->prompt.tokens.size();
+                    res->generation_id = slot->generation_id;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_ROLLBACK:
+                {
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->prompt.tokens.has_mtmd) {
+                        send_error(task, "rollback is not supported with multimodal content", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    const int32_t target_pos = task.checkpoint_pos;
+                    if (target_pos < 0 || target_pos > (int32_t) slot->prompt.tokens.size()) {
+                        send_error(task, "Invalid checkpoint position", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    // Safety: verify generation_id matches to prevent stale rollback
+                    if (task.generation_id >= 0 && task.generation_id != slot->generation_id) {
+                        send_error(task, "Stale checkpoint: slot was recycled since this checkpoint was created", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    const int32_t from_pos = (int32_t) slot->prompt.tokens.size();
+
+                    // Some cache configs (quantized KV, speculative draft) can only
+                    // remove a full sequence, not an arbitrary mid-position range.
+                    // Pre-validate BOTH contexts before mutating either, so a rollback
+                    // the draft cache can't honor never leaves tgt/dft out of sync.
+                    auto can_rollback = [&](common_context_seq_rm_type t, llama_context * c) {
+                        const int32_t span = from_pos - target_pos;
+                        if (span <= 0)       { return true; }                          // nothing to remove
+                        if (target_pos == 0) { return t != COMMON_CONTEXT_SEQ_RM_TYPE_NO; } // full clear
+                        switch (t) {                                                   // partial mid removal
+                            case COMMON_CONTEXT_SEQ_RM_TYPE_PART: return true;
+                            case COMMON_CONTEXT_SEQ_RM_TYPE_RS:   return span <= (int32_t) llama_n_rs_seq(c);
+                            default:                              return false;         // NO / FULL
+                        }
+                    };
+
+                    if (!can_rollback(ctx_tgt_seq_rm_type, ctx_tgt) ||
+                        (slot->ctx_dft && !can_rollback(ctx_dft_seq_rm_type, slot->ctx_dft))) {
+                        send_error(task, "Rollback to this position is not supported by the current cache configuration", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+
+                    // Both contexts can honor the rollback - now safe to mutate.
+                    slot->mem.seq_rm(slot->id, target_pos, -1);
+
+                    // Truncate the token list
+                    slot->prompt.tokens.keep_first(target_pos);
+
+                    auto res = std::make_unique<server_task_result_slot_rollback>();
+                    res->id        = task.id;
+                    res->id_slot   = id_slot;
+                    res->from_pos  = from_pos;
+                    res->to_pos    = target_pos;
+                    res->n_removed = from_pos - target_pos;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_FORK:
+                {
+                    const int src_slot = task.slot_fork_action.src_slot;
+                    const int dst_slot = task.slot_fork_action.dst_slot;
+                    server_slot * slot_src = get_slot_by_id(src_slot);
+                    server_slot * slot_dst = get_slot_by_id(dst_slot);
+                    if (slot_src == nullptr || slot_dst == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot_src->prompt.tokens.has_mtmd) {
+                        send_error(task, "fork is not supported with multimodal content", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (slot_src->is_processing() || slot_dst->is_processing()) {
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    int32_t p0 = task.slot_fork_action.p0;
+                    int32_t p1 = task.slot_fork_action.p1;
+
+                    const int32_t n_src = (int32_t) slot_src->prompt.tokens.size();
+                    if (p1 < 0) {
+                        p1 = n_src;
+                    }
+
+                    (void) dst_slot;
+
+                    // "Fork" by stashing the source slot's state into the prompt cache rather
+                    // than copying KV cells directly. A direct sequence copy (seq_cp, or even a
+                    // state serialize/deserialize into another seq) is NOT credited by the
+                    // prefill-reuse logic, so the forked slot would still reprocess the whole
+                    // prefix. Instead we make the source's prefix available to every slot through
+                    // the prompt cache; the destination slot then warm-loads the shared prefix on
+                    // its next cache_prompt request — the same restore path a returning
+                    // conversation already uses (and which the pinned-slot swap performs).
+                    if (!prompt_cache) {
+                        send_error(task, "Slot fork requires the prompt cache (enable cache-ram)", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (n_src > 0) {
+                        slot_src->prompt_save(*prompt_cache);
+                        prompt_cache->update();
+                    }
+
+                    auto res = std::make_unique<server_task_result_slot_fork>();
+                    res->id       = task.id;
+                    res->src_slot = src_slot;
+                    res->dst_slot = dst_slot;
+                    res->p0       = p0;
+                    res->p1       = p1;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_GET_LORA:
@@ -3115,6 +3303,9 @@ private:
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.stats.update_prompt_start();
 
+                        // Auto-checkpoint: record position before this task
+                        slot.checkpoint_pos = (int32_t) slot.prompt.tokens.size();
+
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
@@ -3195,6 +3386,14 @@ private:
                                 if (slot.alora_invocation_start > 0) {
                                     SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
                                     n_past = std::min(n_past, slot.alora_invocation_start - 1);
+                                }
+
+                                // clear stale cache if common prefix is too small
+                                if (slot.prompt.tokens.size() > 0 && (float)n_past / slot.prompt.tokens.size() < 0.25f) {
+                                    slot.mem.seq_rm(slot.id, -1, -1);
+                                    slot.prompt.tokens.clear();
+                                    slot.prompt.checkpoints.clear();
+                                    n_past = 0;
                                 }
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
@@ -4597,6 +4796,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "endpoint_slots",              params.endpoint_slots },
         { "endpoint_props",              params.endpoint_props },
         { "endpoint_metrics",            params.endpoint_metrics },
+        { "prompt_cache",                params.cache_ram_mib != 0 },
         { "ui",                          params.ui },
         { "ui_settings",                 meta.json_ui_settings },
         { "chat_template",               tmpl_default },
@@ -4768,6 +4968,12 @@ void server_routes::init_routes() {
         }
         if (action == "erase") {
             return handle_slots_erase(req, id_slot);
+        }
+        if (action == "checkpoint") {
+            return handle_slot_checkpoint(req, id_slot);
+        }
+        if (action == "rollback") {
+            return handle_slot_rollback(req, id_slot);
         }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
@@ -5258,6 +5464,9 @@ void server_routes::init_routes() {
         res->ok(result->to_json());
         return res;
     };
+    this->post_slot_fork = [this](const server_http_req & req) {
+        return handle_slot_fork(req);
+    };
 }
 
 std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const server_http_req & req, int id_slot) {
@@ -5356,6 +5565,108 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
     }
 
     GGML_ASSERT(dynamic_cast<server_task_result_slot_erase*>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slot_checkpoint(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+    const json request_data = json::parse(req.body);
+    std::string name = json_value(request_data, "name", std::string());
+
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_CHECKPOINT);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot = id_slot;
+        task.checkpoint_name = name;
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slot_rollback(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+    const json request_data = json::parse(req.body);
+    int32_t pos = json_value(request_data, "pos", -1);
+    if (pos < 0) {
+        res->error(format_error_response("\"pos\" must be a non-negative integer", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    // generation_id guards against stale rollbacks after slot recycling.
+    // Default -1 means "no check" (backwards-compatible for callers that omit it).
+    int32_t generation_id = json_value(request_data, "generation_id", -1);
+
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_ROLLBACK);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot = id_slot;
+        task.checkpoint_pos  = pos;
+        task.generation_id   = generation_id;
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slot_fork(const server_http_req & req) {
+    auto res = create_response();
+    const json request_data = json::parse(req.body);
+    int src_slot = json_value(request_data, "src_slot", -1);
+    int dst_slot = json_value(request_data, "dst_slot", -1);
+    if (src_slot < 0 || dst_slot < 0) {
+        res->error(format_error_response("\"src_slot\" and \"dst_slot\" must be non-negative integers", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_FORK);
+        task.id = rd.get_new_id();
+        task.slot_fork_action.src_slot = src_slot;
+        task.slot_fork_action.dst_slot = dst_slot;
+        task.slot_fork_action.p0       = json_value(request_data, "p0", 0);
+        task.slot_fork_action.p1       = json_value(request_data, "p1", -1);
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
     res->ok(result->to_json());
     return res;
 }

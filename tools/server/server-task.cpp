@@ -354,6 +354,10 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
         {"stop_type",           stop_type_to_str(stop)},
         {"stopping_word",       stopping_word},
         {"tokens_cached",       n_tokens_cached},
+        {"checkpoint_pos",      checkpoint_pos},
+        {"generation_id",       generation_id},
+        {"n_ctx_slot",          n_ctx_slot},
+        {"fill_pct",            fill_pct},
         {"timings",             stats.to_json()},
     };
     if (!stream && !probs_output.empty()) {
@@ -1654,6 +1658,45 @@ json server_task_result_slot_erase::to_json() {
 }
 
 //
+// server_task_result_slot_checkpoint
+//
+
+json server_task_result_slot_checkpoint::to_json() {
+    return json {
+        { "id_slot",       id_slot },
+        { "name",          name },
+        { "pos",           pos },
+        { "generation_id", generation_id },
+    };
+}
+
+//
+// server_task_result_slot_rollback
+//
+
+json server_task_result_slot_rollback::to_json() {
+    return json {
+        { "id_slot",   id_slot },
+        { "from_pos",  from_pos },
+        { "to_pos",    to_pos },
+        { "n_removed", n_removed },
+    };
+}
+
+//
+// server_task_result_slot_fork
+//
+
+json server_task_result_slot_fork::to_json() {
+    return json {
+        { "src_slot", src_slot },
+        { "dst_slot", dst_slot },
+        { "p0",       p0 },
+        { "p1",       p1 },
+    };
+}
+
+//
 // server_task_result_get_lora
 //
 
@@ -1780,11 +1823,13 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
             /*.checkpoints =*/ prompt.checkpoints,
+            /*.score       =*/ prompt.score,
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
+        /*.score  =*/ prompt.score,
     });
 
     return &states.back();
@@ -1809,6 +1854,20 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
         SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
 
+        if (whole_seq_only) {
+            // recurrent/hybrid: only a cached entry that is a FULL prefix of the new prompt is
+            // reusable (no partial truncation possible). Among those, pick the one that lets us
+            // skip the most prefill (largest sim). Beats the slot's own prefix (sim_best seed)
+            // so the common growing-conversation case is left untouched.
+            if (lcp_cur == (int) it->prompt.tokens.size() && f_sim_cur > f_sim_best) {
+                f_keep_best = f_keep_cur;
+                f_sim_best  = f_sim_cur;
+
+                it_best = it;
+            }
+            continue;
+        }
+
         // don't trash large prompts
         if (f_keep_cur < 0.25f) {
             continue;
@@ -1824,6 +1883,18 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+
+        // reward cache hit, the score travels with the prompt so it is re-seeded on the next save
+        it_best->prompt.score = std::min((uint8_t)(it_best->prompt.score + 1), (uint8_t)4);
+
+        if (whole_seq_only) {
+            // recurrent/hybrid restore must replace the whole sequence: drop whatever is on the
+            // slot first (full-range seq_rm is allowed; partial is not), then load the snapshot.
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
+            if (ctx_dft) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
+            }
+        }
 
         {
             auto & data = it_best->data.main;
@@ -1862,17 +1933,52 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         prompt = std::move(it_best->prompt);
 
         states.erase(it_best);
+        return true;
+    }
+
+    // no better cache entry found, return false if slot's data is a poor match so caller can clear the slot
+    if (!prompt.tokens.empty() && f_keep_best < 0.25f) {
+        return false;
     }
 
     return true;
 }
 
 void server_prompt_cache::update() {
+    // second-chance eviction: decay score and rotate to back, evict when score <= 1
+    auto evict_one = [this]() {
+        if (states.size() <= 1) {
+            return;
+        }
+
+        // hard iteration cap to prevent infinite loops when all entries have max score
+        const size_t max_iter = states.size() * 5;
+        size_t iter = 0;
+
+        while (states.size() > 1) {
+            if (iter++ >= max_iter) {
+                SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+                states.pop_front();
+                return;
+            }
+
+            if (states.front().score <= 1) {
+                // score has decayed, safe to evict
+                SRV_WRN(" - cache limit reached, evicting unused/decayed entry (size = %.3f MiB)\n",
+                        states.front().size() / (1024.0 * 1024.0));
+                states.pop_front();
+                return;
+            }
+
+            // second chance: decay score and rotate to back
+            states.front().score--;
+            states.splice(states.end(), states, states.begin());
+        }
+    };
+
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            evict_one();
         }
     }
 
@@ -1884,10 +1990,7 @@ void server_prompt_cache::update() {
 
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            evict_one();
         }
     }
 

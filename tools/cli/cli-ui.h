@@ -10,14 +10,16 @@
 #include <string_view>
 
 // TODO?: Make this reusable, enums, docs
-static const std::array<std::string_view, 8> cmds = {
+static const std::array<std::string_view, 10> cmds = {
     "/audio ",
+    "/checkpoint",
     "/clear",
     "/exit",
     "/glob ",
     "/image ",
     "/read ",
     "/regen",
+    "/rollback ",
     "/video ",
 };
 
