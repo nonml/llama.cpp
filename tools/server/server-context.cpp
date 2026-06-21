@@ -9,6 +9,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "gguf.h"
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
@@ -22,6 +23,7 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <set>
 #include <utility>
 #include <fstream>
 
@@ -35,6 +37,95 @@
 #endif
 
 using json = nlohmann::ordered_json;
+
+// ---------------------------------------------------------------------------
+// DFlash recurrent rollback plan helpers
+// ---------------------------------------------------------------------------
+
+server_dflash_recurrent_rollback_plan server_context_dflash_recurrent_rollback_plan(
+        const common_params_speculative & speculative,
+        bool target_recurrent_or_hybrid) {
+    server_dflash_recurrent_rollback_plan plan;
+
+    if (speculative.type() != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || !target_recurrent_or_hybrid) {
+        return plan;
+    }
+
+    plan.needs_backup_sequences        = true;
+    plan.needs_attention_backup_streams = speculative.branch_budget > 0;
+    return plan;
+}
+
+struct server_model_arch_probe {
+    bool known                = false;
+    bool recurrent_or_hybrid  = false;
+    std::string name;
+};
+
+static bool server_arch_name_is_recurrent_or_hybrid(const std::string & name) {
+    static const std::set<std::string> recurrent_or_hybrid = {
+        "mamba",
+        "mamba2",
+        "rwkv6",
+        "rwkv6qwen2",
+        "rwkv7",
+        "arwkv7",
+        "jamba",
+        "falcon-h1",
+        "plamo2",
+        "granitehybrid",
+        "lfm2",
+        "lfm2moe",
+        "nemotron_h",
+        "nemotron_h_moe",
+        "qwen3next",
+        "kimi-linear",
+        "qwen35",
+        "qwen35moe",
+    };
+
+    return recurrent_or_hybrid.find(name) != recurrent_or_hybrid.end();
+}
+
+static server_model_arch_probe server_probe_model_arch(const std::string & path_model) {
+    server_model_arch_probe result;
+
+    if (path_model.empty()) {
+        return result;
+    }
+
+    ggml_context * ctx_meta = nullptr;
+    gguf_init_params gguf_params = {
+        /*.no_alloc =*/ true,
+        /*.ctx      =*/ &ctx_meta,
+    };
+
+    gguf_context * ctx_gguf = gguf_init_from_file(path_model.c_str(), gguf_params);
+    if (!ctx_gguf) {
+        if (ctx_meta) {
+            ggml_free(ctx_meta);
+        }
+        return result;
+    }
+
+    const int64_t key = gguf_find_key(ctx_gguf, "general.architecture");
+    if (key >= 0 && gguf_get_kv_type(ctx_gguf, key) == GGUF_TYPE_STRING) {
+        const char * arch_name = gguf_get_val_str(ctx_gguf, key);
+        if (arch_name) {
+            result.known              = true;
+            result.name               = arch_name;
+            result.recurrent_or_hybrid = server_arch_name_is_recurrent_or_hybrid(result.name);
+        }
+    }
+
+    gguf_free(ctx_gguf);
+    if (ctx_meta) {
+        ggml_free(ctx_meta);
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
@@ -80,6 +171,13 @@ struct server_slot {
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
+
+    // DFlash recurrent backup state (tape-replay rollback)
+    bool has_draft_backup          = false;
+    bool has_recurrent_only_backup = false;
+    llama_seq_id seq_id_backup     = -1;
+    int  n_tokens_before_draft     = 0;  // prompt token count before draft tokens were added
+    llama_pos n_pos_before_draft   = 0;  // KV position before draft tokens
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -228,6 +326,13 @@ struct server_slot {
         n_draft_accepted = 0;
         n_draft_verif_steps = 0;
         n_accepted_per_pos.clear();
+
+        // clear recurrent backup state
+        has_draft_backup          = false;
+        has_recurrent_only_backup = false;
+        seq_id_backup             = -1;
+        n_tokens_before_draft     = 0;
+        n_pos_before_draft        = 0;
 
         task_prev = std::move(task);
         task.reset();
@@ -390,6 +495,16 @@ struct server_slot {
             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
 
             state = SLOT_STATE_IDLE;
+
+            // clean up speculative backup sequence to avoid orphaned KV cells
+            if (has_draft_backup && seq_id_backup >= 0) {
+                llama_memory_t mem = llama_get_memory(ctx_tgt);
+                if (has_recurrent_only_backup) {
+                    llama_memory_seq_rm_recurrent(mem, seq_id_backup, -1, -1);
+                } else {
+                    llama_memory_seq_rm(mem, seq_id_backup, -1, -1);
+                }
+            }
 
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
@@ -597,6 +712,9 @@ struct server_slot {
     // caller need to update prompt.tokens after a successful call to keep track of the processing progress
     int process_mtmd_chunk(size_t idx, size_t & n_tokens_out) {
         GGML_ASSERT(mctx);
+        // NOTE: only the target decodes the image. Memory-less feature-conditioned drafters
+        // (DFlash) never see the image features, so draft quality degrades on multimodal prompts.
+        // TODO: infuse the image-position target features into such drafters [TAG_MTMD_DRAFT_PROCESSING]
         const auto & input_tokens = task->tokens;
         const auto & chunk = input_tokens.find_chunk(idx);
         int32_t res = 0;
@@ -807,6 +925,14 @@ private:
 
     int32_t n_ctx; // total context for all clients / slots
 
+    // DFlash recurrent rollback: backup sequence management
+    bool needs_reeval                   = false; // target is recurrent or hybrid
+    int  n_parallel_user                = 0;     // user-visible parallel slots
+    int  n_seq_max_full                 = 0;     // visible slots plus optional recurrent backup cells
+    bool recurrent_expanded             = true;  // false = backup cells deferred, expand before first draft
+    bool recurrent_backup_sequences     = false; // explicit backup seqs for speculative recurrent rollback
+    bool recurrent_backup_attention_streams = false; // backup seqs also have attention KV streams
+
     // set to llama_model_n_swa(model)
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
     int32_t n_swa;
@@ -863,6 +989,38 @@ private:
         sleeping = new_state;
     }
 
+    server_dflash_recurrent_rollback_plan speculative_recurrent_rollback_plan() const {
+        server_dflash_recurrent_rollback_plan plan;
+
+        if (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
+            return plan;
+        }
+
+        const server_model_arch_probe arch = server_probe_model_arch(params_base.model.path);
+        if (!arch.known) {
+            SRV_WRN("%s", "could not determine target architecture before DFlash context allocation; reserving recurrent-only backup cells conservatively\n");
+            plan.needs_backup_sequences = true;
+            return plan;
+        }
+
+        plan = server_context_dflash_recurrent_rollback_plan(
+                params_base.speculative,
+                arch.recurrent_or_hybrid);
+
+        if (!arch.recurrent_or_hybrid) {
+            SRV_INF("DFlash target architecture %s does not need recurrent rollback; keeping n_parallel=%d\n",
+                    arch.name.c_str(), params_base.n_parallel);
+        } else if (plan.needs_attention_backup_streams) {
+            SRV_WRN("DFlash DDTree target architecture %s needs attention backup streams for branch rollback\n",
+                    arch.name.c_str());
+        } else if (plan.needs_backup_sequences) {
+            SRV_INF("flat DFlash target architecture %s will use recurrent-only backup cells; keeping attention streams at n_parallel=%d\n",
+                    arch.name.c_str(), params_base.n_parallel);
+        }
+
+        return plan;
+    }
+
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
@@ -872,6 +1030,12 @@ private:
 
         params_base = params;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
+
+        n_parallel_user = params_base.n_parallel;
+        n_seq_max_full  = n_parallel_user;
+        recurrent_expanded              = true;
+        recurrent_backup_sequences      = false;
+        recurrent_backup_attention_streams = false;
 
         std::string & mmproj_path = params_base.mmproj.path;
         bool has_mmproj = !mmproj_path.empty();
@@ -991,7 +1155,39 @@ private:
             }
         }
 
+        // DFlash recurrent rollback: probe GGUF arch and decide backup sequence allocation
+        {
+            const server_dflash_recurrent_rollback_plan recurrent_plan = speculative_recurrent_rollback_plan();
+            if (recurrent_plan.needs_backup_sequences) {
+                n_seq_max_full = n_parallel_user * 2;
+                recurrent_expanded = false;
+                recurrent_backup_sequences = true;
+                recurrent_backup_attention_streams = recurrent_plan.needs_attention_backup_streams;
+
+                if (recurrent_backup_attention_streams) {
+                    params_base.n_parallel = n_seq_max_full;
+                }
+            }
+        }
+
+        // DFlash extracts per-layer target features into a single buffer that holds only the
+        // last decoded ubatch, but common_speculative_process() reads back the whole batch's
+        // worth of features. If a batch is split into multiple ubatches (n_batch > n_ubatch),
+        // that read overruns the buffer (segfault) and intermediate ubatch features are lost.
+        // Cap the target's logical batch to one ubatch so every batch == one ubatch.
+        const uint32_t n_batch_user = params_base.n_batch;
+        if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH &&
+                params_base.n_ubatch > 0 && params_base.n_batch > params_base.n_ubatch) {
+            SRV_INF("DFlash: capping target n_batch %u -> n_ubatch %u so feature extraction covers the full batch\n",
+                    params_base.n_batch, params_base.n_ubatch);
+            params_base.n_batch = params_base.n_ubatch;
+        }
+
         llama_init = common_init_from_params(params_base);
+        params_base.n_parallel = n_parallel_user;
+        // The cap above only applies to the target context (already constructed). Restore the
+        // user's n_batch so the draft context (built below from params_base) is unaffected.
+        params_base.n_batch = n_batch_user;
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -1003,9 +1199,30 @@ private:
 
         vocab = llama_model_get_vocab(model_tgt);
 
+        needs_reeval = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
+        if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH &&
+                needs_reeval &&
+                !recurrent_backup_sequences &&
+                llama_n_rs_seq(ctx_tgt) == 0) {
+            SRV_ERR("%s", "DFlash target requires recurrent rollback, but neither recurrent snapshots nor backup cells are available\n");
+            return false;
+        }
+
         n_ctx = llama_n_ctx(ctx_tgt);
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
+
+        // DFlash recurrent rollback: shrink recurrent state before draft model load so
+        // the draft context measures only the user-visible slot range.
+        if (recurrent_backup_sequences && recurrent_backup_attention_streams && !recurrent_expanded && needs_reeval) {
+            if (llama_context_recurrent_shrink(ctx_tgt, n_parallel_user)) {
+                SRV_INF("shrunk recurrent state to %d cells before draft load (deferred %d backup cells)\n",
+                        n_parallel_user, n_seq_max_full - n_parallel_user);
+            } else {
+                SRV_ERR("failed to shrink recurrent state to %d cells before draft load\n", n_parallel_user);
+                return false;
+            }
+        }
 
         if (params_base.speculative.has_dft()) {
             // TODO speculative: move to common/speculative.cpp?
@@ -1030,6 +1247,45 @@ private:
 
             auto mparams_dft = common_model_params_to_llama(params_dft);
 
+            // DFlash: pin drafter to a single GPU when target is tensor-split
+            {
+                const bool tgt_tensor_split = params_base.split_mode == LLAMA_SPLIT_MODE_TENSOR ||
+                                              params_base.split_mode == LLAMA_SPLIT_MODE_ROW;
+
+                if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH &&
+                        tgt_tensor_split && getenv("DFLASH_ALLOW_TENSOR_SPLIT") == nullptr) {
+                    SRV_ERR("%s", "DFlash speculative decoding is not supported with -sm tensor / -sm row "
+                            "on this build: the multi-GPU all-reduce deadlocks on PCIe GPUs without "
+                            "NVLink/NCCL. Use -sm layer (recommended), or build with NCCL (Linux/WSL) and "
+                            "set DFLASH_ALLOW_TENSOR_SPLIT=1 to override.\n");
+                    GGML_ABORT("DFlash + -sm tensor/-sm row unsupported without NCCL; use -sm layer");
+                }
+
+                // The tiny DFlash drafter must run on a single concrete backend (like MTP, which
+                // shares the target and stays on one device). Layer-splitting it across GPUs
+                // (default under -sm layer) puts its small encoder/decoder ops on mismatched
+                // devices -> "fc_out in a buffer (CUDA1) cannot run MUL_MAT". Pin it to ONE GPU.
+                // Prefer the last GPU, which is where the target's output.weight (lm_head) lives
+                // under -sm layer, so the drafter references the target lm_head without copying it
+                // (avoids OOM from materializing a ~1GB lm_head onto an already-full GPU).
+                int n_gpu = 0;
+                for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                    if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        n_gpu++;
+                    }
+                }
+                const char * draft_gpu_env = getenv("DFLASH_DRAFT_GPU");
+                const int draft_gpu = draft_gpu_env ? atoi(draft_gpu_env) : (n_gpu > 0 ? n_gpu - 1 : (int) params_base.main_gpu);
+                if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH &&
+                        n_gpu > 1 && draft_gpu >= 0) {
+                    mparams_dft.split_mode = LLAMA_SPLIT_MODE_NONE;
+                    mparams_dft.main_gpu   = draft_gpu;
+                    SRV_INF("DFlash: pinning draft model to single GPU %d (split_mode=NONE) so its "
+                            "graph runs on one concrete backend%s\n", draft_gpu,
+                            tgt_tensor_split ? " (target is tensor-split)" : "");
+                }
+            }
+
             model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
             if (model_dft == nullptr) {
                 SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
@@ -1048,8 +1304,14 @@ private:
 
             // note: for small models maybe we can set this to the maximum possible draft from all speculative types
             //       the extra memory for small models is likely negligible?
-            cparams.n_rs_seq  = 0;
-            cparams.ctx_other = ctx_tgt;
+            cparams.n_rs_seq     = 0;
+            cparams.ctx_other    = ctx_tgt;
+            cparams.target_model = model_tgt;
+
+            if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
+                cparams.n_batch  = std::max(cparams.n_batch,  (uint32_t) 128);
+                cparams.n_ubatch = std::clamp(cparams.n_ubatch, (uint32_t) 128, cparams.n_batch);
+            }
 
             ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
 
@@ -2648,12 +2910,13 @@ private:
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
-                            /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
-                            /* .n_past   = */ slot.prompt.n_tokens(),
-                            /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
-                            /* .result   = */ &slot.spec_draft,
+                            /* .drafting    = */ true,
+                            /* .n_max       = */ n_draft_max,
+                            /* .n_past      = */ slot.prompt.n_tokens(),
+                            /* .id_last     = */ slot.sampled,
+                            /* .prompt      = */ &slot.spec_prompt,
+                            /* .result      = */ &slot.spec_draft,
+                            /* .target_temp = */ slot.task->params.sampling.temp,
                         };
 
                         drafting.push_back(&slot);
@@ -2688,9 +2951,18 @@ private:
             }
 
             if (!draft.empty()) {
+                // DFlash with backup sequences handles rollback via tape replay;
+                // skip the expensive 150MB checkpoint serialization.
+                const bool dflash_handles_rollback =
+                    needs_reeval &&
+                    recurrent_backup_sequences &&
+                    params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH &&
+                    ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+
                 const bool use_ckpt_tgt =
-                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                   (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt));
+                    !dflash_handles_rollback && (
+                        ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                       (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt)));
 
                 const bool use_ckpt_dft =
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft.get()));
@@ -2712,6 +2984,59 @@ private:
                 if (use_ckpt_dft) {
                     ckpt.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
+
+                // DFlash recurrent backup: create backup sequence instead of checkpoint
+                // when the target context is recurrent/hybrid and backup sequences are configured.
+                if (needs_reeval &&
+                        params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH &&
+                        ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+                    if (!recurrent_backup_sequences) {
+                        GGML_ABORT("speculative recurrent rollback requires backup sequences when bounded snapshots are unavailable\n");
+                    }
+                    if (!recurrent_expanded) {
+                        if (llama_context_recurrent_expand(ctx_tgt, n_seq_max_full)) {
+                            SRV_INF("expanded recurrent state to %d cells for speculative backup\n", n_seq_max_full);
+                        } else {
+                            SRV_ERR("failed to expand recurrent state to %d cells\n", n_seq_max_full);
+                            GGML_ABORT("failed to expand recurrent state for speculative backup; continuing would corrupt recurrent replay\n");
+                        }
+                        recurrent_expanded = true;
+                        llama_dflash_allocate_slots(ctx_tgt, 1);
+                    }
+                    const llama_seq_id seq_backup = slot.id + n_parallel_user;
+                    auto * mem = llama_get_memory(ctx_tgt);
+                    if (recurrent_backup_attention_streams) {
+                        llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                    } else {
+                        llama_memory_seq_rm_recurrent(mem, seq_backup, -1, -1);
+                    }
+
+                    // use ordered async copy; fall back to synchronous copy on failure
+                    const bool ordered = llama_dflash_memory_seq_cp_recurrent_ordered(ctx_tgt, slot.id, seq_backup, -1, -1);
+                    if (!ordered) {
+                        llama_memory_seq_cp_recurrent(mem, slot.id, seq_backup, -1, -1);
+                    }
+
+                    slot.has_recurrent_only_backup = true;
+                    slot.has_draft_backup          = true;
+                    slot.seq_id_backup             = seq_backup;
+                    slot.n_tokens_before_draft     = slot.prompt.n_tokens();
+                    slot.n_pos_before_draft        = slot.prompt.tokens.pos_next();
+                }
+            }
+        }
+
+        // DFlash recurrent: synchronize tape replay before target decode when any slot has a backup
+        if (needs_reeval && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
+            bool any_dflash_draft = false;
+            for (const auto * slot_ptr : drafting) {
+                if (slot_ptr->has_draft_backup) {
+                    any_dflash_draft = true;
+                    break;
+                }
+            }
+            if (any_dflash_draft) {
+                llama_tape_replay_sync(ctx_tgt);
             }
         }
 
@@ -3370,6 +3695,12 @@ private:
                 continue; // continue loop of n_batch
             }
 
+            // DFlash: record how many tokens the target decoded so the tape-replay path
+            // knows which token states are valid for recurrent state restoration.
+            if (needs_reeval && recurrent_expanded) {
+                llama_dflash_set_tape_tokens(ctx_tgt, n_tokens);
+            }
+
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             //       for now, always re-evaluate for simplicity
             //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
@@ -3509,12 +3840,16 @@ private:
 
                 GGML_ASSERT(n_draft > 0);
 
+                uint32_t n_rollback        = 0;
+                bool use_dflash_rollback   = false;
+
                 // verify and try to accept the draft
                 {
                     // save the sampler sampler state in case we need to restore it
                     common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+
                     auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                     slot.spec_i_batch.clear();
 
@@ -3522,9 +3857,15 @@ private:
 
                     const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
+                    use_dflash_rollback =
+                        slot.has_draft_backup &&
+                        params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH &&
+                        ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+
                     const bool use_ckpt_tgt =
-                        ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                       (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
+                        !use_dflash_rollback && (
+                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                           (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt)));
 
                     // check for partial draft acceptance
                     if (n_rollback > 0) {
@@ -3572,6 +3913,10 @@ private:
 
                 const auto ids = std::move(slot.spec_draft);
 
+                // the anchor token that started this draft block (slot.sampled is overwritten below);
+                // needed to re-decode the accepted prefix under tensor-split rollback
+                const llama_token id_last_input = slot.sampled;
+
                 slot.t_token_generation = std::max<int64_t>(1, t_now - slot.t_start_generation) / 1e3;
 
                 // update how many tokens out of those tested were accepted
@@ -3592,9 +3937,57 @@ private:
                 slot.sampled = ids.back(); // last accepted token
                 SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-                common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
-                if (slot.ctx_dft) {
-                    common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
+                // manage KV state and backup sequences
+                if (use_dflash_rollback) {
+                    const llama_seq_id seq_backup = slot.seq_id_backup;
+                    if (n_rollback > 0) {
+                        // partial acceptance: roll the recurrent (DeltaNet) state back.
+                        // ids.size() == n_accepted_draft + 1 (last element is the next-to-sample token).
+                        const int n_hidden_keep = (int) ids.size();
+                        if (llama_dflash_recurrent_is_meta(slot.ctx_tgt)) {
+                            // Tensor-split (-sm tensor / -sm row): the GPU tape-replay assumes the
+                            // un-split head order and corrupts the meta-split recurrent state. Instead
+                            // restore the pre-draft backup (n_accepted=0 trims attention back to
+                            // pre-draft and restores recurrent from the backup seq) and re-decode the
+                            // accepted prefix [id_last, accepted drafts] through the normal forward,
+                            // which advances both states correctly under the meta backend.
+                            llama_dflash_rollback(slot.ctx_tgt, slot.id, seq_backup, slot.n_pos_before_draft, 0);
+                            // the recurrent restore (seq_cp_recurrent_no_sync) is async; ensure it
+                            // completes before the re-decode reads the recurrent state
+                            llama_synchronize(slot.ctx_tgt);
+                            llama_batch rb = llama_batch_init(n_hidden_keep, 0, 1);
+                            llama_pos pos = slot.n_pos_before_draft;
+                            common_batch_add(rb, id_last_input, pos++, { slot.id }, false);
+                            for (size_t i = 0; i + 1 < ids.size(); ++i) {
+                                common_batch_add(rb, ids[i], pos++, { slot.id }, false);
+                            }
+                            if (llama_decode(slot.ctx_tgt, rb) != 0) {
+                                SLT_ERR(slot, "DFlash re-decode rollback failed (n_hidden_keep=%d)\n", n_hidden_keep);
+                            }
+                            llama_batch_free(rb);
+                        } else {
+                            if (trace > 0) {
+                                SLT_INF(slot, "DFlash tape-replay rollback: n_hidden_keep=%d\n", n_hidden_keep);
+                            }
+                            llama_dflash_rollback(slot.ctx_tgt, slot.id, seq_backup, slot.n_pos_before_draft, n_hidden_keep);
+                        }
+                    } else {
+                        // full acceptance: clean up backup seq; KV is already correct
+                        auto * mem = llama_get_memory(slot.ctx_tgt);
+                        if (slot.has_recurrent_only_backup) {
+                            llama_memory_seq_rm_recurrent(mem, seq_backup, -1, -1);
+                        } else {
+                            llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                        }
+                    }
+                    slot.has_draft_backup          = false;
+                    slot.has_recurrent_only_backup = false;
+                    slot.seq_id_backup             = -1;
+                } else {
+                    common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
+                    if (slot.ctx_dft) {
+                        common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
+                    }
                 }
 
                 for (size_t i = 0; i < ids.size(); ++i) {

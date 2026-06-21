@@ -383,6 +383,10 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
 
+        // EAGLE3/DFlash extraction configuration
+        const struct llama_model * target_model; // reference to target model
+                                                 // only used to share embedding layer with eagle3/dflash model
+
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
@@ -576,6 +580,10 @@ extern "C" {
 
     // Returns label of classifier output by index (<n_cls_out). Returns nullptr if no label provided
     LLAMA_API const char * llama_model_cls_label(const struct llama_model * model, uint32_t i);
+
+    // DFlash model metadata accessors (returns -1 when not a DFlash model)
+    LLAMA_API int32_t llama_model_dflash_block_size    (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_dflash_mask_token_id (const struct llama_model * model);
 
     LLAMA_API enum llama_vocab_type llama_vocab_type(const struct llama_vocab * vocab);
 
@@ -772,6 +780,53 @@ extern "C" {
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
+
+    // Check if llama_memory_seq_rm() can remove this range from the current memory state
+    // without mutating the memory.
+    LLAMA_API bool llama_memory_can_seq_rm(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    // Remove seq_id from a specific cell by index (not position range).
+    LLAMA_API bool llama_memory_seq_rm_cell(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                uint32_t cell_idx);
+
+    // Return the number of KV cells at a given position for a seq_id.
+    LLAMA_API int llama_memory_cells_at_pos(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos pos,
+               uint32_t * cell_indices,
+                     int n_max);
+
+    // Copy only recurrent state (skip KV/attention) between sequences
+    LLAMA_API void llama_memory_seq_cp_recurrent(
+            llama_memory_t mem,
+              llama_seq_id seq_id_src,
+              llama_seq_id seq_id_dst,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    // Remove only recurrent state (skip KV/attention) for a sequence.
+    LLAMA_API bool llama_memory_seq_rm_recurrent(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    // Expand the recurrent state to new_n_seq_max cells (for deferred backup allocation).
+    LLAMA_API bool llama_memory_recurrent_expand(llama_memory_t mem, uint32_t new_n_seq_max);
+
+    // Shrink the recurrent state to new_n_seq_max cells (frees GPU memory for prefill).
+    LLAMA_API bool llama_memory_recurrent_shrink(llama_memory_t mem, uint32_t new_n_seq_max);
+
+    // Context-level recurrent resize. These also invalidate the context scheduler/graph cache.
+    LLAMA_API bool llama_context_recurrent_expand(struct llama_context * ctx, uint32_t new_n_seq_max);
+    LLAMA_API bool llama_context_recurrent_shrink(struct llama_context * ctx, uint32_t new_n_seq_max);
 
     //
     // State / sessions
@@ -1580,6 +1635,113 @@ extern "C" {
             int64_t                   idata_split,
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
+
+    //
+    // eagle3 (tmp)
+    //
+
+    LLAMA_API void llama_set_eagle3(
+            struct llama_context * ctx,
+            const struct llama_model * model);
+
+    //
+    // EAGLE3 draft model support
+    //
+
+    // Get pointer to target model features extracted for EAGLE3 encoder
+    LLAMA_API const float * llama_get_eagle3_target_features(struct llama_context * ctx);
+
+    // Set g_embeddings from EAGLE3 encoder output for decoder input
+    LLAMA_API void llama_set_eagle3_g_embeddings(
+            struct llama_context * ctx,
+                   const float * g_embd,
+                       int32_t   n_embd,
+                       int32_t   n_tokens);
+
+    //
+    // DFlash draft model support (similar to EAGLE3)
+    //
+
+    // Enable DFlash target feature extraction on the target context
+    LLAMA_API void llama_set_dflash(
+            struct llama_context * ctx,
+            const struct llama_model * model);
+
+    LLAMA_API const float * llama_get_dflash_target_features(struct llama_context * ctx);
+
+    // Temporarily toggle DFlash decoder mode on the context.
+    LLAMA_API void llama_set_dflash_decoder_mode(struct llama_context * ctx, bool decoder_mode);
+
+    // Set accumulated target_ctx for DFlash decoder
+    LLAMA_API void llama_set_dflash_accumulated_target_ctx(
+            struct llama_context * ctx,
+                   const float * data,
+                       int32_t   n_embd,
+                       int32_t   n_tokens);
+
+    // DFlash: incrementally project new encoder tokens to per-layer K/V cache
+    LLAMA_API void llama_dflash_update_kv_proj(
+            struct llama_context * ctx,
+                   const float  * features,
+                       int32_t    n_embd,
+                       int32_t    n_new);
+
+    // DFlash: reset the per-layer K/V projection cache
+    LLAMA_API void llama_dflash_reset_kv_proj(struct llama_context * ctx);
+
+    // DFlash: returns true once at least one token has been projected into the K/V cache
+    LLAMA_API bool llama_dflash_kv_proj_valid(const struct llama_context * ctx);
+
+    //
+    // DFlash tape-replay and slot management
+    //
+
+    enum {
+        LLAMA_DFLASH_MAX_VERIFY_TOKENS = 25,
+        LLAMA_DFLASH_MAX_SLOTS         = 8,
+        LLAMA_DFLASH_PER_SLOT_CTX      = 512,
+    };
+
+    // DFlash: allocate per-slot GPU tape + hidden-capture buffers for multi-slot use.
+    LLAMA_API void llama_dflash_allocate_slots(struct llama_context * ctx, int n_slots);
+
+    // DFlash: true if the recurrent layers are tensor-split across GPUs
+    LLAMA_API bool llama_dflash_recurrent_is_meta(struct llama_context * ctx);
+
+    // DFlash: select which slot's GPU tape the next llama_decode() writes into.
+    LLAMA_API void llama_dflash_set_active_slot(struct llama_context * ctx, int slot_idx);
+
+    // DFlash: record how many tokens were written into the active GPU tape.
+    LLAMA_API void llama_dflash_set_tape_tokens(struct llama_context * ctx, int n_tokens);
+
+    // DFlash: replay tape data to reconstruct DeltaNet state after partial acceptance
+    LLAMA_API void llama_tape_replay(struct llama_context * ctx, llama_seq_id seq_id, int n_accepted);
+
+    // DFlash: complete rollback for hybrid models after partial acceptance
+    LLAMA_API void llama_dflash_rollback(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            llama_seq_id           seq_backup,
+            int                    n_past_before,
+            int                    n_accepted);
+
+    // DFlash: wait for async tape replay to complete
+    LLAMA_API void llama_tape_replay_sync(struct llama_context * ctx);
+
+    // DFlash: recurrent-only backup copy with CUDA stream ordering when available.
+    LLAMA_API bool llama_dflash_memory_seq_cp_recurrent_ordered(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id_src,
+            llama_seq_id           seq_id_dst,
+            llama_pos              p0,
+            llama_pos              p1);
+
+    // DFlash: prepare DeltaNet state for branch verification
+    LLAMA_API void llama_dflash_prepare_branch(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            llama_seq_id           seq_backup,
+            int                    depth);
 
 #ifdef __cplusplus
 }

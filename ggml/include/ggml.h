@@ -584,6 +584,9 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_GATED_DELTA_NET_TREE,
+        GGML_OP_SSM_CONV_TREE,
+
         GGML_OP_COUNT,
     };
 
@@ -2572,6 +2575,28 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // Tree-mode gated delta net: processes tokens with tree structure via parent_ids
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_tree(
+            struct ggml_context * ctx,
+            struct ggml_tensor *  q,
+            struct ggml_tensor *  k,
+            struct ggml_tensor *  v,
+            struct ggml_tensor *  g,
+            struct ggml_tensor *  beta,
+            struct ggml_tensor *  state,
+            struct ggml_tensor *  parent_ids,
+            int                   n_tokens);
+
+    // Tree-mode SSM conv: follows parent pointers for convolution window
+    GGML_API struct ggml_tensor * ggml_ssm_conv_tree(
+            struct ggml_context * ctx,
+            struct ggml_tensor *  a,
+            struct ggml_tensor *  b,
+            struct ggml_tensor *  c,
+            struct ggml_tensor *  d,
+            struct ggml_tensor *  parent_ids,
+            int                   n_tokens);
 
     // custom operators
 

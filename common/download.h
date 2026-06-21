@@ -55,6 +55,7 @@ struct common_download_opts {
     bool skip_download = false; // if true, only validation is performed, common_skip_download_exception may be thrown if the file is missing or invalid
     bool download_mmproj = false;
     bool download_mtp = false;
+    bool download_dflash = false;
     common_download_callback * callback = nullptr;
 };
 
@@ -63,6 +64,7 @@ struct common_download_model_result {
     std::string model_path;
     std::string mmproj_path;
     std::string mtp_path;
+    std::string dflash_path;
     std::string preset_path;
 };
 
@@ -95,7 +97,7 @@ struct common_skip_download_exception : public std::runtime_error {
 // then with the closest quantization bits
 // when download_mtp=true, applies the same sibling search for an MTP-head GGUF
 //
-// returns result with model_path, mmproj_path and mtp_path (empty when not found / on failure)
+// returns result with model_path, mmproj_path, mtp_path, and dflash_path (empty when not found / on failure)
 common_download_model_result common_download_model(
     const common_params_model & model,
     const common_download_opts & opts = {}

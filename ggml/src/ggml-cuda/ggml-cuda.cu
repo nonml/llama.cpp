@@ -5613,6 +5613,14 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+extern "C" bool dflash_rebuild_conv_state(void *, const void *, int, int, int);
+extern "C" bool dflash_cuda_prepare_ptr(const void *);
+extern "C" bool dflash_cuda_set_device(int);
+extern "C" bool dflash_cuda_synchronize_ptr(const void *);
+extern "C" bool dflash_cuda_ptr_device(const void *, int *);
+extern "C" bool dflash_cuda_synchronize_device(int);
+extern "C" bool dflash_replay_gdn_state_no_check(void *, const void *, const void *, const void *, const void *, int, int, int, int);
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5635,6 +5643,27 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "dflash_rebuild_conv_state") == 0) {
+        return (void *)dflash_rebuild_conv_state;
+    }
+    if (strcmp(name, "dflash_cuda_prepare_ptr") == 0) {
+        return (void *)dflash_cuda_prepare_ptr;
+    }
+    if (strcmp(name, "dflash_cuda_set_device") == 0) {
+        return (void *)dflash_cuda_set_device;
+    }
+    if (strcmp(name, "dflash_cuda_synchronize_ptr") == 0) {
+        return (void *)dflash_cuda_synchronize_ptr;
+    }
+    if (strcmp(name, "dflash_cuda_ptr_device") == 0) {
+        return (void *)dflash_cuda_ptr_device;
+    }
+    if (strcmp(name, "dflash_cuda_synchronize_device") == 0) {
+        return (void *)dflash_cuda_synchronize_device;
+    }
+    if (strcmp(name, "dflash_replay_gdn_state_no_check") == 0) {
+        return (void *)dflash_replay_gdn_state_no_check;
     }
     return nullptr;
 }

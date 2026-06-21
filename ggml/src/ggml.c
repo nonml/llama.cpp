@@ -1076,9 +1076,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "GATED_DELTA_NET_TREE",
+    "SSM_CONV_TREE",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1187,9 +1190,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "gated_delta_net_tree(x)",
+    "ssm_conv_tree(x)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6264,6 +6270,56 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+// ggml_gated_delta_net_tree
+
+struct ggml_tensor * ggml_gated_delta_net_tree(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * parent_ids,
+        int                   n_tokens) {
+    GGML_UNUSED(n_tokens);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, q);
+    result->op     = GGML_OP_GATED_DELTA_NET_TREE;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+    result->src[6] = parent_ids;
+
+    return result;
+}
+
+// ggml_ssm_conv_tree
+
+struct ggml_tensor * ggml_ssm_conv_tree(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * d,
+        struct ggml_tensor  * parent_ids,
+        int                   n_tokens) {
+    GGML_UNUSED(n_tokens);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+    result->op     = GGML_OP_SSM_CONV_TREE;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = c;
+    result->src[3] = d;
+    result->src[4] = parent_ids;
 
     return result;
 }

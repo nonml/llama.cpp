@@ -3616,6 +3616,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
     add_opt(common_arg(
+        {"--spec-draft-temp"}, "T",
+        string_format("drafter sampling temperature (default: %.1f, 0 = greedy)", (double) params.speculative.sample_temp),
+        [](common_params & params, const std::string & value) {
+            params.speculative.sample_temp = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-draft-topk"}, "K",
+        string_format("top-K candidates per drafter position (default: %d)", params.speculative.draft_topk),
+        [](common_params & params, int value) {
+            params.speculative.draft_topk = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-draft-slots"}, "N",
+        string_format("concurrent drafter slots (default: %d)", params.speculative.n_slots),
+        [](common_params & params, int value) {
+            params.speculative.n_slots = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-cross-ctx"}, "N",
+        string_format("cross-attention context window in tokens (default: %d, 0 = no cap)", params.speculative.cross_ctx),
+        [](common_params & params, int value) {
+            params.speculative.cross_ctx = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--spec-type"}, common_speculative_all_types_str(),
         string_format("comma-separated list of types of speculative decoding to use (default: %s)\n",
             common_speculative_type_name_str(params.speculative.types).c_str()),

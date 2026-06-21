@@ -161,12 +161,20 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,  // standalone draft model speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
+    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // draft-free speculative decoding (cross-attention conditioned)
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_COPYSPEC,      // copy from context (rolling hash match)
+    COMMON_SPECULATIVE_TYPE_RECYCLE,       // token recycling (top-k successors)
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
+};
+
+enum common_speculative_dm_controller {
+    COMMON_SPECULATIVE_DM_CONTROLLER_FRINGE,
+    COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT,
 };
 
 // Grammar type enumeration
@@ -307,6 +315,8 @@ struct common_params_model {
     }
 };
 
+struct common_ngram_mod;
+
 // draft-model-based speculative decoding parameters
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
@@ -322,6 +332,28 @@ struct common_params_speculative_draft {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
+    uint16_t ngram_size_n   = 12; // ngram size for lookup
+    uint16_t ngram_size_m   = 48; // mgram size for speculative tokens
+    uint16_t ngram_min_hits = 1; // minimum hits at ngram/mgram lookup for mgram to be proposed
+
+    std::shared_ptr<common_ngram_mod> ngram_mod;
+
+    std::string lookup_cache_static;  // path of static ngram cache file for lookup decoding           // NOLINT
+    std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding          // NOLINT
+
+    // draft-model speculative decoding
+
+    struct common_params_model mparams_dft;
+
+    llama_model * model_tgt = nullptr; // the target model
+    llama_model * model_dft = nullptr; // a llama_model that can be shared by multiple speculative contexts
+
+    llama_context_params cparams_dft; // these are the parameters for the draft llama_context
+
+    bool    eagle3       = false; // use EAGLE3 speculative decoding
+    bool    dflash       = false; // use DFlash speculative decoding
+
+    int32_t n_ctx        = 0;  // draft context size
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
@@ -366,8 +398,40 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
+    // copyspec: copy from context (rolling hash match)
+    int32_t copyspec_gamma = 6;  // window size for rolling hash match
+
+    // recycle: token recycling (top-k successors)
+    int32_t recycle_k = 8;  // top-k successors per token
+
+    // draft tuning
+    int32_t n_max          = 0;
+    int32_t branch_budget  = 0;
+    int32_t draft_topk     = 1;
+    int32_t cross_ctx      = 0;
+    float   sample_temp    = 0.0f;
+    float   p_min          = 0.0f;
+    int32_t n_slots        = 1;      // concurrent drafter slots
+    bool    verify_logits  = false;  // compact logits for verifier
+    int32_t verify_topk    = 1;      // top-K for verifier
+    bool    consume_reduced = false; // server-side sampling mode
+    bool    gpu_capture    = true;   // GPU hidden/tape capture
+    bool    tape_recording = false;  // DeltaNet tape recording
+
     bool has_dft() const {
         return !draft.mparams.path.empty() || !draft.mparams.hf_repo.empty();
+    }
+
+    bool has_type(common_speculative_type t) const {
+        return std::find(types.begin(), types.end(), t) != types.end();
+    }
+
+    // fork: single-type compat helper (most fork code checks one type at a time)
+    common_speculative_type type() const {
+        if (types.empty() || (types.size() == 1 && types[0] == COMMON_SPECULATIVE_TYPE_NONE)) {
+            return COMMON_SPECULATIVE_TYPE_NONE;
+        }
+        return types.back();
     }
 
     uint32_t need_n_rs_seq() const {

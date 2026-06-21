@@ -475,6 +475,9 @@ struct llama_layer {
     struct ggml_tensor * ffn_act_beta    = nullptr;
     struct ggml_tensor * ffn_act_eps     = nullptr;
 
+    // eagle3
+    struct ggml_tensor * eagle3_hidden_norm = nullptr;
+
     // Kimi Linear KDA (using ssm_ prefix for consistency)
     // Note: ssm_dt_b already exists above (mamba bias), reused for Kimi dt_bias
     struct ggml_tensor * ssm_q_conv = nullptr;
@@ -575,6 +578,19 @@ struct llama_model {
 
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
+
+    // reference to target model's embedding layer (EAGLE3/DFlash)
+    struct ggml_tensor * target_tok_embd = nullptr;
+
+    // dflash
+    struct ggml_tensor * dflash_hidden_norm = nullptr;
+    struct ggml_tensor * target_output = nullptr;
+
+    // dflash: concrete (non-meta) copies of the target's tok_embd/output, materialized when the
+    // drafter is pinned to a single GPU while the target is tensor-split (meta). Owned here so
+    // they outlive the draft context; freed in ~llama_model.
+    std::vector<struct ggml_context *>        dflash_concrete_ctxs;
+    std::vector<ggml_backend_buffer_t>        dflash_concrete_bufs;
 
     std::vector<llama_layer> layers;
 

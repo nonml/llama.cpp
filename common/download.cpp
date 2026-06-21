@@ -627,6 +627,11 @@ static hf_cache::hf_file find_best_mtp(const hf_cache::hf_files & files,
     return find_best_sibling(files, model, "mtp-");
 }
 
+static hf_cache::hf_file find_best_dflash(const hf_cache::hf_files & files,
+                                          const std::string        & model) {
+    return find_best_sibling(files, model, "dflash-");
+}
+
 static bool gguf_filename_is_model(const std::string & filepath) {
     if (!string_ends_with(filepath, ".gguf")) {
         return false;
@@ -639,7 +644,8 @@ static bool gguf_filename_is_model(const std::string & filepath) {
 
     return filename.find("mmproj")  == std::string::npos &&
            filename.find("imatrix") == std::string::npos &&
-           filename.find("mtp-")    == std::string::npos;
+           filename.find("mtp-")    == std::string::npos &&
+           filename.find("dflash-") == std::string::npos;
 }
 
 static hf_cache::hf_file find_best_model(const hf_cache::hf_files & files,
@@ -696,13 +702,15 @@ struct hf_plan {
     hf_cache::hf_files model_files;
     hf_cache::hf_file mmproj;
     hf_cache::hf_file mtp;
+    hf_cache::hf_file dflash;
     hf_cache::hf_file preset; // if set, only this file is downloaded
 };
 
 static hf_plan get_hf_plan(const common_params_model  & model,
                            const common_download_opts & opts,
                            bool download_mmproj,
-                           bool download_mtp) {
+                           bool download_mtp,
+                           bool download_dflash) {
     hf_plan plan;
     hf_cache::hf_files all;
 
@@ -760,6 +768,10 @@ static hf_plan get_hf_plan(const common_params_model  & model,
         plan.mtp = find_best_mtp(all, primary.path);
     }
 
+    if (download_dflash) {
+        plan.dflash = find_best_dflash(all, primary.path);
+    }
+
     return plan;
 }
 
@@ -799,10 +811,11 @@ common_download_model_result common_download_model(const common_params_model  & 
 
     bool download_mmproj = opts.download_mmproj;
     bool download_mtp = opts.download_mtp;
+    bool download_dflash = opts.download_dflash;
     bool is_hf = !model.hf_repo.empty();
 
     if (is_hf) {
-        hf = get_hf_plan(model, opts, download_mmproj, download_mtp);
+        hf = get_hf_plan(model, opts, download_mmproj, download_mtp, download_dflash);
         if (!hf.preset.path.empty()) {
             // if preset.ini exists, only download that file alone
             tasks.push_back({hf.preset.url, hf.preset.local_path});
@@ -816,6 +829,9 @@ common_download_model_result common_download_model(const common_params_model  & 
             if (!hf.mtp.path.empty()) {
                 tasks.push_back({hf.mtp.url, hf.mtp.local_path});
             }
+        }
+        if (!hf.dflash.path.empty()) {
+            tasks.push_back({hf.dflash.url, hf.dflash.local_path});
         }
     } else if (!model.url.empty()) {
         tasks = get_url_tasks(model);
@@ -864,6 +880,10 @@ common_download_model_result common_download_model(const common_params_model  & 
 
             if (!hf.mtp.path.empty()) {
                 result.mtp_path = hf_cache::finalize_file(hf.mtp);
+            }
+
+            if (!hf.dflash.path.empty()) {
+                result.dflash_path = hf_cache::finalize_file(hf.dflash);
             }
         }
     } else {
@@ -1006,7 +1026,8 @@ std::vector<common_cached_model_info> common_list_cached_models() {
         auto split = get_gguf_split_info(f.path);
         if (split.index != 1 || split.tag.empty() ||
             split.prefix.find("mmproj") != std::string::npos ||
-            split.prefix.find("mtp-")   != std::string::npos) {
+            split.prefix.find("mtp-")   != std::string::npos ||
+            split.prefix.find("dflash-")!= std::string::npos) {
             continue;
         }
         if (seen.insert(f.repo_id + ":" + split.tag).second) {

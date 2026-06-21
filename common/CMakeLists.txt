@@ -92,6 +92,9 @@ add_library(${TARGET}
     ngram-map.h
     ngram-mod.cpp
     ngram-mod.h
+    int32-map.h
+    suffix-tree.cpp
+    suffix-tree.h
     peg-parser.cpp
     peg-parser.h
     preset.cpp

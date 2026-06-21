@@ -34,6 +34,7 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
     LLM_GRAPH_TYPE_DECODER_MTP,
+    LLM_GRAPH_TYPE_DFLASH_KV_PROJ,  // DFlash incremental K/V projection (no attention)
 };
 
 enum llm_ffn_op_type : int {
@@ -72,8 +73,64 @@ struct llama_cross {
     // embeddings data copied to host memory (tmp)
     std::vector<float> v_embd;
 
+    // DFlash: incremental per-layer K/V projection cache.
+    bool     kv_proj_valid    = false;  // true once at least 1 token has been projected
+    int64_t  n_embd_k_proj    = 0;      // = n_embd_head_k * n_head_kv
+    int64_t  n_embd_v_proj    = 0;      // same
+
+    // Fast path: cache resident on the decoder's layer devices. Only newly-projected rows
+    // cross PCIe (O(n_new)); the decode graph reads the accumulated K/V via views over these
+    // persistent tensors. Used whenever the layer devices are concrete (single-GPU, -sm layer).
+    bool     kv_proj_device   = false;  // true => use k_proj_t/v_proj_t, false => host k_proj/v_proj
+    int64_t  kv_proj_capacity = 0;      // columns allocated per persistent tensor
+    std::vector<ggml_tensor *> k_proj_t; // [n_layer] each [n_embd_k_proj, kv_proj_capacity]
+    std::vector<ggml_tensor *> v_proj_t; // [n_layer] each [n_embd_v_proj, kv_proj_capacity]
+
+    // Fallback path (used under -sm tensor / meta backend, which cannot view external tensors):
+    // host-resident cache re-uploaded as graph inputs each step.
+    std::vector<std::vector<float>> k_proj;  // [n_layer][n_enc * n_embd_k_proj], row-major
+    std::vector<std::vector<float>> v_proj;  // [n_layer][n_enc * n_embd_v_proj], row-major
+
     // needed to construct the cross-attention mask in the decoder
     std::vector<std::set<llama_seq_id>> seq_ids_enc;
+};
+
+// EAGLE3 support - stores intermediate features from target model
+struct llama_eagle3 {
+    // Configuration: which layers to extract from target model
+    std::vector<int> extract_layer_indices;
+
+    // Extracted features from target model (for encoder input)
+    std::vector<float> target_features;
+
+    // Encoder output (for decoder input)
+    std::vector<float> g_embeddings;
+
+    // Tensor references for feature extraction from target model
+    std::vector<ggml_tensor *> extract_tensors;
+
+    // Clear all stored data
+    void clear() {
+        target_features.clear();
+        g_embeddings.clear();
+        extract_tensors.clear();
+    }
+};
+
+// DFlash intermediate results struct
+struct llama_dflash {
+    std::vector<int> extract_layer_indices;
+
+    std::vector<float> target_features;
+
+    std::vector<ggml_tensor *> extract_tensors;
+
+    bool capture_extract = true;
+
+    void clear() {
+        target_features.clear();
+        extract_tensors.clear();
+    }
 };
 
 struct llm_graph_params;
@@ -277,6 +334,19 @@ public:
     ggml_tensor * cross_embd; // F32 [n_embd, n_outputs_enc]
 
     const llama_cross * cross;
+};
+
+class llm_graph_input_cross_kv_proj : public llm_graph_input_i {
+public:
+    llm_graph_input_cross_kv_proj(const llama_cross * cross, int il) : cross(cross), il(il) {}
+    virtual ~llm_graph_input_cross_kv_proj() = default;
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * k_cross = nullptr;  // F32 [n_embd_k_proj, n_enc]
+    ggml_tensor * v_cross = nullptr;  // F32 [n_embd_v_proj, n_enc]
+
+    const llama_cross * cross;
+    int il;
 };
 
 class llm_graph_input_attn_no_cache : public llm_graph_input_i {
@@ -602,6 +672,8 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    llama_eagle3                 * eagle3;  // non-const: we write extracted features here
+    llama_dflash                 * dflash;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -702,6 +774,7 @@ public:
     ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
     ggml_tensor * get_logits()      const { return t_logits; }
     ggml_tensor * get_embd()        const { return t_embd; }
+    ggml_tensor * get_embd_v()      const { return t_embd_v; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
 
@@ -733,6 +806,7 @@ public:
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
+    ggml_tensor * t_embd_v      = nullptr;  // DFlash KV proj: stacked V projection output
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
@@ -824,6 +898,8 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    llama_eagle3                 * eagle3;  // non-const: we write extracted features here
+    llama_dflash                 * dflash;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -952,6 +1028,8 @@ struct llm_graph_context {
     ggml_tensor * build_inp_cls() const;
 
     ggml_tensor * build_inp_cross_embd() const;
+    struct cross_kv_tensors { ggml_tensor * k; ggml_tensor * v; };
+    cross_kv_tensors build_inp_cross_kv_proj(int il) const;
     ggml_tensor * build_inp_pos_bucket_enc() const;
     ggml_tensor * build_inp_pos_bucket_dec() const;
     ggml_tensor * build_pos_bias(ggml_tensor * pos_bucket, ggml_tensor * attn_rel_b) const;

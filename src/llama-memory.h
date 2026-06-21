@@ -27,6 +27,15 @@ struct llama_memory_params {
     llama_memory_t mem_other;
 };
 
+struct llama_memory_recurrent_copy_profile {
+    uint64_t layers_scanned = 0;
+    uint64_t tensors_copied = 0;
+    uint64_t cuda_d2d_queued = 0;
+    uint64_t fallback_copies = 0;
+    uint64_t enqueue_us = 0;
+    uint64_t sync_us = 0;
+};
+
 enum llama_memory_status {
     LLAMA_MEMORY_STATUS_SUCCESS = 0,
     LLAMA_MEMORY_STATUS_NO_UPDATE,
@@ -109,6 +118,22 @@ struct llama_memory_i {
 
     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
+
+    // Copy only recurrent state (skip KV/attention). Used by DFlash flat-mode backup
+    // where KV backup is unnecessary. Default delegates to seq_cp.
+    virtual void seq_cp_recurrent(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+        seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    }
+
+    // Remove only recurrent state for a sequence (not attention KV).
+    // Default delegates to seq_rm.
+    virtual bool seq_rm_recurrent(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+        return seq_rm(seq_id, p0, p1);
+    }
+
+    virtual void recurrent_copy_profile_reset() {}
+    virtual llama_memory_recurrent_copy_profile recurrent_copy_profile() const { return {}; }
+
     virtual void seq_keep(llama_seq_id seq_id) = 0;
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;

@@ -7,11 +7,13 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-dflash-tape.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
 #include <map>
+#include <memory>
 #include <vector>
 
 struct llama_model;
@@ -128,6 +130,35 @@ struct llama_context {
                 int32_t   n_embd,
                 int32_t   il_start,
                 int32_t   il_end);
+
+    // TODO: tmp
+    void set_eagle3(const llama_model * model);
+    void set_dflash(const llama_model * model);
+
+    // DFlash tape-replay: reconstruct DeltaNet state after n_accepted tokens were accepted.
+    // Launches async GDN kernel; conv rebuild is deferred until tape_replay_sync().
+    void tape_replay(llama_seq_id seq_id, int n_accepted);
+
+    // Wait for the async GDN kernel started by tape_replay() and run conv-state rebuild.
+    void tape_replay_sync();
+
+    // Full rollback for hybrid models: KV trim + recurrent restore + tape replay.
+    void dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, int n_past_before, int n_accepted);
+
+    // Prepare DeltaNet state for branch verification (recurrent restore + tape replay, no KV touch).
+    void dflash_prepare_branch(llama_seq_id seq_id, llama_seq_id seq_backup, int depth);
+
+    // Select which slot's tape the next llama_decode() writes into.
+    void set_dflash_active_slot(int slot_idx);
+
+    // Ensure capture data is created and tape/hidden-gpu slot vectors have at
+    // least n_slots entries.  Creates an empty dflash_capture_data if needed.
+    void dflash_allocate_slots(int n_slots);
+
+    // Set the number of tokens recorded in the active tape after a decode pass.
+    // Must be called after each llama_decode() call on a context with tape recording
+    // enabled so that the tape-replay path knows how many token states are valid.
+    void dflash_set_tape_tokens(int n_tokens);
 
     // process a single ubatch with a specific graph type
     // if memory_context is provided, it will be applied first to the context's memory
@@ -248,7 +279,34 @@ public:
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr, int gtype_override = -1);
+
+    // EAGLE3: Get pointer to target model features extracted for EAGLE3 encoder
+    const float * get_eagle3_target_features() const;
+
+    // EAGLE3: Set g_embeddings from encoder output for decoder input
+    void set_eagle3_g_embeddings(const float * g_embd, int32_t n_embd, int32_t n_tokens);
+
+    // DFlash: Get pointer to target model features extracted for DFlash encoder
+    const float * get_dflash_target_features() const;
+
+    // DFlash: Set accumulated target_ctx from encoder output for decoder input
+    void set_dflash_accumulated_target_ctx(const float * data, int32_t n_embd, int32_t n_tokens);
+
+    // DFlash: Incrementally project new encoder tokens to K/V and accumulate into per-layer cache
+    void dflash_update_kv_proj(const float * features, int32_t n_embd, int32_t n_new);
+
+    // DFlash: (re)allocate the device-resident K/V projection cache; falls back to host on meta buft
+    void dflash_kv_proj_alloc();
+
+    // DFlash: Reset the per-layer K/V projection cache
+    void dflash_reset_kv_proj();
+
+    bool dflash_kv_proj_valid() const { return cross.kv_proj_valid; }
+
+    void set_dflash_decoder_mode(bool mode) { dflash_decoder_ctx = mode; }
+
+    bool dflash_recurrent_is_meta() const { return dflash_recurrent_meta; }
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
@@ -260,6 +318,12 @@ private:
                           llm_graph_type   gtype) const;
 
     llm_graph_cb graph_get_cb() const;
+
+    // EAGLE3: Extract intermediate layer features from target model
+    void extract_eagle3_features(const llama_ubatch & ubatch);
+
+    // DFlash: Extract intermediate layer features from target model
+    void extract_dflash_features(const llama_ubatch & ubatch);
 
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
@@ -280,6 +344,22 @@ private:
     llama_adapter_loras_ptr loras;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
+
+    mutable llama_eagle3 eagle3; // EAGLE3 draft model support - stores features from target model
+                                 // mutable because it's modified during graph building (const function)
+
+    mutable llama_dflash dflash;
+
+    // DFlash tape-replay state (owned by drafter context; null on target contexts).
+    std::unique_ptr<dflash_capture_data> dflash_capture;
+
+    // DFlash: true when the recurrent layers are tensor-split (meta backend, -sm tensor/-sm row).
+    // The GPU tape-replay rollback is incorrect there; the server re-decodes accepted tokens.
+    bool dflash_recurrent_meta = false;
+
+    // temp fix: avoid DFlash encoder/decoder mis-detection. They share one model_dft,
+    // so shared model fields cannot safely identify the decoder (caused OOM).
+    bool dflash_decoder_ctx = false;
 
     llama_memory_ptr memory;
 
@@ -361,6 +441,12 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+    llm_graph_result_ptr gf_res_kv_proj;   // dedicated result for DFlash KV projection graphs
+    bool                 using_kv_proj_mode = false;  // routes process_ubatch to gf_res_kv_proj
+
+    // DFlash: device-resident storage backing cross.k_proj_t / cross.v_proj_t (per layer-device)
+    std::vector<ggml_context_ptr>      dflash_kv_proj_ctxs;
+    std::vector<ggml_backend_buffer_t> dflash_kv_proj_bufs;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

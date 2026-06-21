@@ -436,6 +436,20 @@ struct llama_model_qwen : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+struct llm_build_dflash_encode : public llm_graph_context {
+    llm_build_dflash_encode(const llama_model & model, const llm_graph_params & params);
+private:
+    ggml_tensor * build_inp_embd() const;
+};
+
+struct llm_build_dflash_decode : public llm_graph_context {
+    llm_build_dflash_decode(const llama_model & model, const llm_graph_params & params);
+};
+
+struct llm_build_dflash_kv_proj : public llm_graph_context {
+    llm_build_dflash_kv_proj(const llama_model & model, const llm_graph_params & params);
+};
+
 
 struct llama_model_qwen2 : public llama_model_base {
     llama_model_qwen2(const struct llama_model_params & params) : llama_model_base(params) {}
@@ -536,6 +550,15 @@ struct llama_model_qwen3 : public llama_model_base {
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
     };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
+struct llama_model_dflash : public llama_model_qwen3 {
+    llama_model_dflash(const struct llama_model_params & params) : llama_model_qwen3(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };

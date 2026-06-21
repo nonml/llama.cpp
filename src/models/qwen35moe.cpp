@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-dflash-tape.h"
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
@@ -182,6 +183,20 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
+
+        // DFlash: Extract intermediate layer features from target model
+        if (dflash && cparams.dflash_extract_enabled && !dflash->extract_layer_indices.empty()) {
+            static const char * dflash_extract_names[] = {
+                "dflash_extract_0", "dflash_extract_1", "dflash_extract_2",
+                "dflash_extract_3", "dflash_extract_4"
+            };
+            for (size_t i = 0; i < dflash->extract_layer_indices.size() && i < 5; ++i) {
+                if (dflash->extract_layer_indices[i] == il) {
+                    cb(inpL, dflash_extract_names[i], il);
+                    break;
+                }
+            }
+        }
 
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
@@ -386,6 +401,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
+    ggml_tensor * beta_presigmoid = beta;  // tape capture: pre-sigmoid value
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
@@ -408,6 +424,9 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     ggml_tensor * conv_kernel      = model.layers[il].ssm_conv1d;
     const int64_t conv_kernel_size = conv_kernel->ne[0];
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
+
+    ggml_tensor * qkv_mixed_pretranspose = qkv_mixed;  // tape capture: pre-transpose form
+    cb(qkv_mixed_pretranspose, "qkv_mixed_pretranspose", il);
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
@@ -470,6 +489,67 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     cb(q_conv, "q_conv_predelta", il);
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
+
+    // DFlash tape capture: copy pre-activation recurrent tensors to GPU tape buffers
+    // so the tape-replay path can reconstruct the DeltaNet state without a full forward pass.
+    if (cparams.tape_gpu_n_seqs > 0) {
+        for (int s = 0; s < (int)n_seqs && s < cparams.tape_gpu_n_seqs; ++s) {
+            auto * tgpu = cparams.tape_gpu_seqs[s];
+            if (!tgpu) continue;
+
+            int li = -1;
+            for (int i = 0; i < (int)tgpu->layer_ids.size(); ++i) {
+                if (tgpu->layer_ids[i] == il) { li = i; break; }
+            }
+            if (li < 0 || n_seq_tokens > tgpu->max_tokens) continue;
+
+            auto & tl = tgpu->layers[li];
+
+            ggml_tensor * k_slice = ggml_view_3d(ctx0, k_conv,
+                k_conv->ne[0], k_conv->ne[1], n_seq_tokens,
+                k_conv->nb[1], k_conv->nb[2], s * k_conv->nb[3]);
+            ggml_tensor * v_slice = ggml_view_3d(ctx0, v_conv,
+                v_conv->ne[0], v_conv->ne[1], n_seq_tokens,
+                v_conv->nb[1], v_conv->nb[2], s * v_conv->nb[3]);
+            ggml_tensor * g_slice = ggml_view_3d(ctx0, gate,
+                gate->ne[0], gate->ne[1], n_seq_tokens,
+                gate->nb[1], gate->nb[2], s * gate->nb[3]);
+            ggml_tensor * b_slice = ggml_view_3d(ctx0, beta_presigmoid,
+                beta_presigmoid->ne[0], beta_presigmoid->ne[1], n_seq_tokens,
+                beta_presigmoid->nb[1], beta_presigmoid->nb[2], s * beta_presigmoid->nb[3]);
+            ggml_tensor * qkv_slice = ggml_view_2d(ctx0, qkv_mixed_pretranspose,
+                qkv_mixed_pretranspose->ne[0], n_seq_tokens,
+                qkv_mixed_pretranspose->nb[1], s * qkv_mixed_pretranspose->nb[2]);
+
+            ggml_tensor * k_cont   = ggml_cont(ctx0, k_slice);
+            ggml_tensor * v_cont   = ggml_cont(ctx0, v_slice);
+            ggml_tensor * g_cont   = ggml_cont(ctx0, g_slice);
+            ggml_tensor * b_cont   = ggml_cont(ctx0, b_slice);
+            ggml_tensor * qkv_cont = ggml_cont(ctx0, qkv_slice);
+
+            ggml_tensor * k_dst = ggml_view_3d(ctx0, tl.k,
+                tl.k->ne[0], tl.k->ne[1], (int64_t)n_seq_tokens,
+                tl.k->nb[1], tl.k->nb[2], 0);
+            ggml_tensor * v_dst = ggml_view_3d(ctx0, tl.v,
+                tl.v->ne[0], tl.v->ne[1], (int64_t)n_seq_tokens,
+                tl.v->nb[1], tl.v->nb[2], 0);
+            ggml_tensor * g_dst = ggml_view_3d(ctx0, tl.gate,
+                tl.gate->ne[0], tl.gate->ne[1], (int64_t)n_seq_tokens,
+                tl.gate->nb[1], tl.gate->nb[2], 0);
+            ggml_tensor * b_dst = ggml_view_3d(ctx0, tl.beta,
+                tl.beta->ne[0], tl.beta->ne[1], (int64_t)n_seq_tokens,
+                tl.beta->nb[1], tl.beta->nb[2], 0);
+            ggml_tensor * qkv_dst = ggml_view_2d(ctx0, tl.qkv,
+                tl.qkv->ne[0], (int64_t)n_seq_tokens,
+                tl.qkv->nb[1], 0);
+
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, k_cont,   k_dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, v_cont,   v_dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, g_cont,   g_dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, b_cont,   b_dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, qkv_cont, qkv_dst));
+        }
+    }
 
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
 

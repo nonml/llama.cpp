@@ -309,3 +309,7 @@ if (TARGET gguf-model-data)
     target_link_libraries(export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# Server adaptive-DM (DFlash draft-length controller) state machine tests (header-only)
+llama_build_and_test(test-adaptive-dm.cpp)
+target_include_directories(test-adaptive-dm PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)

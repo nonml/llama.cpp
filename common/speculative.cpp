@@ -17,6 +17,7 @@
 #include <iomanip>
 #include <map>
 #include <cinttypes>
+#include <random>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -26,11 +27,14 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
     {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
     {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
+    {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
     {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"copyspec",      COMMON_SPECULATIVE_TYPE_COPYSPEC},
+    {"recycle",       COMMON_SPECULATIVE_TYPE_RECYCLE}
 };
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
@@ -1702,6 +1706,413 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     }
 };
 
+struct common_speculative_impl_dflash : public common_speculative_impl {
+    common_params_speculative_draft draft_params;
+
+    llama_context * ctx_tgt = nullptr;
+    llama_context * ctx_dft = nullptr; // decoder context (has target_model linked)
+
+    llama_batch batch;
+
+    int32_t n_embd_dft = 0;
+
+    std::vector<float> pending_features;
+    int32_t pending_n_tokens = 0;
+
+    common_speculative_impl_dflash(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, n_seq)
+        , draft_params(params.draft)
+    {
+        ctx_tgt = draft_params.ctx_tgt;
+        ctx_dft = draft_params.ctx_dft;
+
+        GGML_ASSERT(ctx_dft && "DFlash requires a draft context");
+        GGML_ASSERT(ctx_tgt && "DFlash requires a target context");
+
+        auto * model_dft = const_cast<llama_model *>(llama_get_model(ctx_dft));
+        n_embd_dft = llama_model_n_embd(model_dft);
+
+        llama_set_dflash(ctx_tgt, model_dft);
+
+        batch = llama_batch_init(llama_n_batch(ctx_dft), 0, 1);
+
+        LOG_INF("%s: adding speculative implementation 'dflash'\n", __func__);
+        LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_embd=%d\n", __func__,
+                llama_model_dflash_block_size(model_dft),
+                llama_model_dflash_mask_token_id(model_dft),
+                n_embd_dft);
+    }
+
+    ~common_speculative_impl_dflash() override {
+        llama_batch_free(batch);
+    }
+
+    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
+        llama_dflash_reset_kv_proj(ctx_dft);
+        encode_pending();
+    }
+
+    bool process(const llama_batch & batch_in) override {
+        if (batch_in.n_tokens <= 0 || batch_in.token == nullptr || batch_in.embd != nullptr) {
+            return true;
+        }
+
+        const int32_t n_tokens = batch_in.n_tokens;
+        const float * features = llama_get_dflash_target_features(ctx_tgt);
+        if (!features) {
+            LOG_ERR("%s: DFlash target features not available\n", __func__);
+            return false;
+        }
+
+        const int n_target_layers = 5;
+        const size_t feature_floats = (size_t)n_target_layers * n_embd_dft * n_tokens;
+        pending_features.insert(pending_features.end(), features, features + feature_floats);
+        pending_n_tokens += n_tokens;
+
+        return true;
+    }
+
+    bool encode_pending() {
+        if (pending_n_tokens <= 0) {
+            return true;
+        }
+
+        const int32_t n_ubatch = (int32_t)llama_n_ubatch(ctx_dft);
+        const int n_target_layers = 5;
+        const size_t feature_stride = (size_t)n_target_layers * n_embd_dft;
+
+        for (int32_t i = 0; i < pending_n_tokens; i += n_ubatch) {
+            const int32_t n_chunk = std::min(n_ubatch, pending_n_tokens - i);
+
+            llama_batch enc_batch = {
+                /*.n_tokens  =*/ n_chunk,
+                /*.token     =*/ nullptr,
+                /*.embd      =*/ pending_features.data() + (size_t)i * feature_stride,
+                /*.pos       =*/ nullptr,
+                /*.n_seq_id  =*/ nullptr,
+                /*.seq_id    =*/ nullptr,
+                /*.logits    =*/ nullptr,
+            };
+            if (llama_encode(ctx_dft, enc_batch) != 0) {
+                LOG_ERR("%s: DFlash encoder failed (chunk %d/%d)\n", __func__, i, pending_n_tokens);
+                return false;
+            }
+
+            const float * encoded = llama_get_embeddings(ctx_dft);
+            if (!encoded) {
+                LOG_ERR("%s: DFlash encoder output is null\n", __func__);
+                return false;
+            }
+
+            llama_dflash_update_kv_proj(ctx_dft, encoded, n_embd_dft, n_chunk);
+        }
+
+        pending_features.clear();
+        pending_n_tokens = 0;
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            llama_tokens & result = *dp.result;
+            result.clear();
+
+            const auto * model_dft = llama_get_model(ctx_dft);
+            const int model_block_cap  = (int)llama_model_dflash_block_size(model_dft);
+            const int ctx_block_cap    = (dp.n_max >= 0) ? dp.n_max : model_block_cap;
+            // draft_params.n_max == user's --spec-draft-n-max (n draft tokens, not including anchor)
+            const int user_block_cap   = (draft_params.n_max > 0) ? (draft_params.n_max + 1) : model_block_cap;
+            const int n_ubatch_dft     = (int)llama_n_ubatch(ctx_dft);
+            const int block_size = std::min({model_block_cap, ctx_block_cap, user_block_cap, n_ubatch_dft});
+
+            if (block_size <= 1) {
+                continue;
+            }
+
+            // Flush any target features accumulated since the last block into the decoder's K/V
+            // projection cache; without this the drafter goes stale after the first block.
+            if (!encode_pending()) {
+                continue;
+            }
+
+            // Don't draft against an unpopulated projection.
+            if (!llama_dflash_kv_proj_valid(ctx_dft)) {
+                continue;
+            }
+
+            // Step: Decode noise block
+            const llama_token mask_token_id = llama_model_dflash_mask_token_id(model_dft);
+
+            common_batch_clear(batch);
+            for (int i = 0; i < block_size; i++) {
+                const llama_token tok = (i == 0) ? dp.id_last : mask_token_id;
+                common_batch_add(batch, tok, i, {seq_id}, true);
+            }
+
+            if (llama_decode(ctx_dft, batch) != 0) {
+                LOG_ERR("DFlash: noise decode failed\n");
+                continue;
+            }
+
+            // Greedy argmax over positions 1..block_size-1 (anchor pos 0 needs no logits)
+            const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+            for (int i = 1; i < block_size; i++) {
+                const float * logits = llama_get_logits_ith(ctx_dft, i);
+                result.push_back((llama_token)(std::max_element(logits, logits + n_vocab) - logits));
+            }
+        }
+    }
+
+    void accept(llama_seq_id /*seq_id*/, uint16_t n_accepted, bool /*is_other*/) override {
+        if (pending_n_tokens <= 0) {
+            return;
+        }
+
+        const int n_target_layers = 5;
+        const int32_t n_commit = std::min((int32_t)(n_accepted + 1), pending_n_tokens);
+        const size_t floats_per_token = (size_t)n_target_layers * n_embd_dft;
+        pending_features.resize((size_t)n_commit * floats_per_token);
+        pending_n_tokens = n_commit;
+    }
+
+    bool need_embd() const override {
+        return false;
+    }
+};
+
+//
+// common_speculative_impl_copyspec
+//
+
+struct common_speculative_impl_copyspec : public common_speculative_impl {
+    static constexpr uint64_t FNV_OFFSET = 14695981039346656037ULL;
+    static constexpr uint64_t FNV_PRIME  = 1099511628211ULL;
+
+    int32_t gamma; // window size for matching
+
+    // hash of gamma-length window -> position after the window in the prompt
+    std::unordered_multimap<uint64_t, int32_t> index;
+    llama_tokens prompt_tokens;
+
+    int32_t original_prompt_size = 0;
+    bool has_model_drafter = false; // true when paired with DFlash/draft (apply primary threshold)
+
+    common_speculative_impl_copyspec(common_speculative_type type, uint32_t n_seq, int32_t gamma)
+        : common_speculative_impl(type, n_seq)
+        , gamma(gamma)
+    {}
+
+    static uint64_t hash_window(const llama_token * tokens, int32_t len) {
+        uint64_t h = FNV_OFFSET;
+        for (int32_t i = 0; i < len; i++) {
+            h ^= (uint64_t)(uint32_t)tokens[i];
+            h *= FNV_PRIME;
+        }
+        return h;
+    }
+
+    void begin(llama_seq_id /*seq_id*/, const llama_tokens & prompt) override {
+        index.clear();
+        prompt_tokens = prompt;
+        original_prompt_size = (int32_t)prompt.size();
+        if ((int32_t)prompt.size() <= gamma) {
+            return;
+        }
+        for (int32_t i = 0; i <= (int32_t)prompt.size() - gamma; i++) {
+            uint64_t h = hash_window(prompt.data() + i, gamma);
+            index.emplace(h, i + gamma);
+        }
+    }
+
+    bool process(const llama_batch & /*batch*/) override {
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            llama_tokens & result = *dp.result;
+            result.clear();
+
+            if (original_prompt_size <= gamma) {
+                return;
+            }
+
+            const int32_t n_max = dp.n_max >= 0 ? dp.n_max : (int32_t)original_prompt_size;
+            if (n_max <= 0) {
+                return;
+            }
+
+            // find the last token's position in the prompt
+            int32_t pos = dp.n_past;
+
+            while ((int32_t)result.size() < n_max) {
+                // compute hash of window ending at pos
+                int32_t win_start = pos - gamma;
+                if (win_start < 0 || pos >= original_prompt_size) {
+                    break;
+                }
+
+                uint64_t h = hash_window(prompt_tokens.data() + win_start, gamma);
+                auto range = index.equal_range(h);
+
+                bool found = false;
+                for (auto it = range.first; it != range.second; ++it) {
+                    int32_t match_pos = it->second;
+                    if (match_pos > pos && match_pos < (int32_t)prompt_tokens.size()) {
+                        // verify the match
+                        bool match = true;
+                        for (int32_t j = 0; j < gamma; j++) {
+                            if (prompt_tokens[win_start + j] != prompt_tokens[match_pos - gamma + j]) {
+                                match = false;
+                                break;
+                            }
+                        }
+                        if (match) {
+                            // copy tokens from the match position
+                            int32_t copy_start = match_pos;
+                            int32_t copy_end = (int32_t)prompt_tokens.size();
+                            int32_t n_to_copy = std::min(copy_end - copy_start, n_max - (int32_t)result.size());
+
+                            for (int32_t j = 0; j < n_to_copy; j++) {
+                                result.push_back(prompt_tokens[copy_start + j]);
+                            }
+
+                            pos = copy_start + n_to_copy;
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!found) {
+                    break;
+                }
+            }
+        }
+    }
+
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
+        // nothing to update
+    }
+
+    bool need_embd() const override { return false; }
+};
+
+//
+// common_speculative_impl_recycle
+//
+
+struct common_speculative_impl_recycle : public common_speculative_impl {
+    int32_t k; // top-k successors per token
+
+    // token -> list of (successor, count)
+    std::unordered_map<llama_token, std::vector<std::pair<llama_token, int>>> successors;
+    llama_tokens prompt_tokens;
+
+    int32_t original_prompt_size = 0;
+    bool has_model_drafter = false;
+
+    common_speculative_impl_recycle(common_speculative_type type, uint32_t n_seq, int32_t k)
+        : common_speculative_impl(type, n_seq)
+        , k(k)
+    {}
+
+    void begin(llama_seq_id /*seq_id*/, const llama_tokens & prompt) override {
+        successors.clear();
+        prompt_tokens = prompt;
+        original_prompt_size = (int32_t)prompt.size();
+
+        if (original_prompt_size < 2) {
+            return;
+        }
+
+        // build successor map
+        for (int32_t i = 0; i < original_prompt_size - 1; i++) {
+            llama_token parent = prompt_tokens[i];
+            llama_token child = prompt_tokens[i + 1];
+
+            auto & vec = successors[parent];
+            bool found = false;
+            for (auto & p : vec) {
+                if (p.first == child) {
+                    p.second++;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                vec.push_back({child, 1});
+            }
+        }
+
+        // sort and keep top-k for each token
+        for (auto & kv : successors) {
+            auto & vec = kv.second;
+            std::sort(vec.begin(), vec.end(), [](const auto & a, const auto & b) {
+                return a.second > b.second;
+            });
+            if ((int32_t)vec.size() > k) {
+                vec.resize(k);
+            }
+        }
+    }
+
+    bool process(const llama_batch & /*batch*/) override {
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            llama_tokens & result = *dp.result;
+            result.clear();
+
+            if (original_prompt_size < 2) {
+                return;
+            }
+
+            const int32_t n_max = dp.n_max >= 0 ? dp.n_max : (int32_t)original_prompt_size;
+            if (n_max <= 0) {
+                return;
+            }
+
+            llama_token last_token = dp.id_last;
+
+            while ((int32_t)result.size() < n_max) {
+                auto it = successors.find(last_token);
+                if (it == successors.end() || it->second.empty()) {
+                    break;
+                }
+
+                // pick the most common successor
+                llama_token next_token = it->second[0].first;
+                result.push_back(next_token);
+                last_token = next_token;
+            }
+        }
+    }
+
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
+        // nothing to update
+    }
+
+    bool need_embd() const override { return false; }
+};
+
 struct common_speculative {
     common_speculative_draft_params_vec dparams;
 
@@ -1769,11 +2180,14 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
         case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
         case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return "ngram-map-k";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
+        case COMMON_SPECULATIVE_TYPE_COPYSPEC:      return "copyspec";
+        case COMMON_SPECULATIVE_TYPE_RECYCLE:       return "recycle";
         default:                                    return "unknown";
     }
 }
@@ -1838,6 +2252,11 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
                 n_max = std::max(n_max, (int32_t) 8);
                 break;
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+                n_max = std::max(n_max, std::max(0, spec->draft.n_max));
+                break;
+            case COMMON_SPECULATIVE_TYPE_COPYSPEC:
+            case COMMON_SPECULATIVE_TYPE_RECYCLE:
             case COMMON_SPECULATIVE_TYPE_NONE:
             case COMMON_SPECULATIVE_TYPE_COUNT:
                 break;
@@ -1857,6 +2276,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
         bool has_draft_simple = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE));
         bool has_draft_eagle3 = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3)) && params.draft.ctx_dft != nullptr;
+        bool has_draft_dflash = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) && params.draft.ctx_dft != nullptr;
         bool has_mtp = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) && params.draft.ctx_dft != nullptr;
 
 
@@ -1866,9 +2286,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_ngram_map_k   = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K));
         bool has_ngram_map_k4v = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V));
         bool has_ngram_mod     = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MOD));
+        bool has_copyspec      = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_COPYSPEC));
+        bool has_recycle       = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_RECYCLE));
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 9);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 12);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -1889,11 +2311,20 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         if (has_ngram_cache) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, params));
         }
+        if (has_copyspec) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_COPYSPEC, params));
+        }
+        if (has_recycle) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_RECYCLE, params));
+        }
         if (has_draft_simple) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE, params));
         }
         if (has_draft_eagle3) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params));
+        }
+        if (has_draft_dflash) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params));
         }
         if (has_mtp) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, params));
@@ -1959,6 +2390,20 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                         params.ngram_cache.lookup_cache_static,
                         params.ngram_cache.lookup_cache_dynamic);
                 impls.push_back(std::make_unique<common_speculative_impl_ngram_cache>(state));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {
+                impls.push_back(std::make_unique<common_speculative_impl_dflash>(config.params, n_seq));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_COPYSPEC: {
+                impls.push_back(std::make_unique<common_speculative_impl_copyspec>(
+                        COMMON_SPECULATIVE_TYPE_COPYSPEC, n_seq, params.copyspec_gamma));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_RECYCLE: {
+                impls.push_back(std::make_unique<common_speculative_impl_recycle>(
+                        COMMON_SPECULATIVE_TYPE_RECYCLE, n_seq, params.recycle_k));
                 break;
             }
             default:

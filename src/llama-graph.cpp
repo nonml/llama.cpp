@@ -385,6 +385,16 @@ void llm_graph_input_cross_embd::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_cross_kv_proj::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (k_cross && il < (int)cross->k_proj.size() && !cross->k_proj[il].empty()) {
+        ggml_backend_tensor_set(k_cross, cross->k_proj[il].data(), 0, ggml_nbytes(k_cross));
+    }
+    if (v_cross && il < (int)cross->v_proj.size() && !cross->v_proj[il].empty()) {
+        ggml_backend_tensor_set(v_cross, cross->v_proj[il].data(), 0, ggml_nbytes(v_cross));
+    }
+}
+
 template <typename T>
 static void print_mask(const T * data, int64_t n_tokens, int64_t n_kv, int64_t n_swa, llama_swa_type swa_type) {
     LLAMA_LOG_DEBUG("%s: === Attention mask ===\n", __func__);
@@ -903,6 +913,7 @@ void llm_graph_result::reset() {
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
     t_embd        = nullptr;
+    t_embd_v      = nullptr;
     t_embd_pooled = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS);
@@ -942,6 +953,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     if (t_embd != nullptr) {
         ggml_set_output(t_embd);
+    }
+    if (t_embd_v != nullptr) {
+        ggml_set_output(t_embd_v);
     }
     if (t_embd_pooled != nullptr) {
         ggml_set_output(t_embd_pooled);
@@ -1062,6 +1076,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    eagle3           (params.eagle3),
+    dflash           (params.dflash),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2016,6 +2032,34 @@ ggml_tensor * llm_graph_context::build_inp_cross_embd() const {
     res->add_input(std::move(inp));
 
     return cur;
+}
+
+llm_graph_context::cross_kv_tensors llm_graph_context::build_inp_cross_kv_proj(int il) const {
+    GGML_ASSERT(cross && cross->kv_proj_valid);
+
+    // Fast path: the projections are already resident on the layer device in
+    // k_proj_t/v_proj_t, each [n_embd_*_proj, kv_proj_capacity]. Read the first n_enc
+    // columns via a view - no per-step host->device upload of the accumulated context.
+    if (cross->kv_proj_device) {
+        GGML_ASSERT(il < (int) cross->k_proj_t.size() && cross->k_proj_t[il] && cross->v_proj_t[il]);
+        ggml_tensor * kf = cross->k_proj_t[il];
+        ggml_tensor * vf = cross->v_proj_t[il];
+        ggml_tensor * k_cross = ggml_view_2d(ctx0, kf, cross->n_embd_k_proj, cross->n_enc, kf->nb[1], 0);
+        ggml_tensor * v_cross = ggml_view_2d(ctx0, vf, cross->n_embd_v_proj, cross->n_enc, vf->nb[1], 0);
+        return cross_kv_tensors{k_cross, v_cross};
+    }
+
+    // Fallback (meta backend): re-upload the host cache as graph inputs each step.
+    auto inp = std::make_unique<llm_graph_input_cross_kv_proj>(cross, il);
+
+    inp->k_cross = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, cross->n_embd_k_proj, cross->n_enc);
+    inp->v_cross = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, cross->n_embd_v_proj, cross->n_enc);
+    ggml_set_input(inp->k_cross);
+    ggml_set_input(inp->v_cross);
+
+    cross_kv_tensors result{inp->k_cross, inp->v_cross};
+    res->add_input(std::move(inp));
+    return result;
 }
 
 ggml_tensor * llm_graph_context::build_inp_pos_bucket_enc() const {

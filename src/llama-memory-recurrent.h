@@ -45,6 +45,16 @@ public:
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+    void seq_cp_recurrent(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override {
+        seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    }
+    bool seq_rm_recurrent(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override {
+        return seq_rm(seq_id, p0, p1);
+    }
+    // Like seq_cp but skips GPU synchronization -- used for async DFlash rollback backup.
+    void seq_cp_recurrent_no_sync(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
+    void recurrent_copy_profile_reset() override;
+    llama_memory_recurrent_copy_profile recurrent_copy_profile() const override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
@@ -60,6 +70,12 @@ public:
     bool find_slot(const llama_ubatch & ubatch);
 
     bool get_can_shift() const override;
+
+    int  get_cell_count(llama_seq_id seq_id) const;
+
+    // expand/shrink the number of cells (for backup sequences in DFlash rollback)
+    bool expand(uint32_t new_mem_size);
+    bool shrink(uint32_t new_mem_size);
 
     // state write/load
 
@@ -121,6 +137,8 @@ private:
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
+    bool resize(uint32_t new_mem_size);
+
     size_t total_size() const;
 
     size_t size_r_bytes() const;
@@ -131,6 +149,33 @@ private:
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
+
+    // CUDA fast D2D copy plan for copy_cell (built lazily, invalidated on resize)
+    using dflash_cuda_copy_d2d_fn_t     = bool (*)(void *, const void *, size_t);
+    using dflash_cuda_ptr_device_fn_t   = bool (*)(const void *, int *);
+    using dflash_cuda_set_device_fn_t   = bool (*)(int);
+    using dflash_cuda_sync_device_fn_t  = bool (*)(int);
+
+    struct recurrent_copy_plan_entry {
+        ggml_tensor * tensor = nullptr;
+        size_t row_bytes = 0;
+        int device = -1;
+    };
+
+    void copy_cell(int32_t i_src, int32_t i_dst);
+    bool build_recurrent_copy_plan();
+    void invalidate_recurrent_copy_plan();
+    void add_recurrent_copy_profile(const llama_memory_recurrent_copy_profile & profile);
+
+    bool copy_plan_valid = false;
+    bool copy_plan_cuda_fast = false;
+    bool copy_cell_synchronize = true;  // set to false for async DFlash rollback backup
+    std::vector<recurrent_copy_plan_entry> copy_plan_entries;
+    std::vector<int> copy_plan_touched_devices;
+    dflash_cuda_copy_d2d_fn_t    copy_plan_fn_copy        = nullptr;
+    dflash_cuda_set_device_fn_t  copy_plan_fn_set_device  = nullptr;
+    dflash_cuda_sync_device_fn_t copy_plan_fn_sync_device = nullptr;
+    llama_memory_recurrent_copy_profile copy_profile;
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {

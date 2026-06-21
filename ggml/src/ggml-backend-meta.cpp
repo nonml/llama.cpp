@@ -548,6 +548,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 tensor->src[1]->ne[src_ss[0].axis] == 1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
         }
+        // src0 fully replicated, src1 split along a real axis with matching extent (no broadcast on
+        // that axis): each backend multiplies its slice of src1 against the mirrored src0, so the
+        // result inherits src1's split. (e.g. DFlash gated attention: mirrored pregate * split gate)
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                src_ss[1].axis >= 0 && src_ss[1].axis < GGML_MAX_DIMS &&
+                tensor->src[0]->ne[src_ss[1].axis] == tensor->src[1]->ne[src_ss[1].axis]) {
+            return src_ss[1];
+        }
         if (src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && (src_ss[0].axis == src_ss[1].axis ||
            (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL)))) {
             return src_ss[0]; // GGML_OP_ADD_ID
@@ -1000,6 +1008,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_OPT_STEP_ADAMW:
             case GGML_OP_OPT_STEP_SGD:
             case GGML_OP_GLU: {
+                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
+            } break;
+            case GGML_OP_GATED_DELTA_NET_TREE:
+            case GGML_OP_SSM_CONV_TREE: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
             default: {

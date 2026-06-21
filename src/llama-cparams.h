@@ -7,6 +7,14 @@
 
 #define LLAMA_MAX_SEQ 256
 
+// Forward declarations for DFlash GPU tape types (full definition in llama-dflash-tape.h).
+struct dflash_tape_gpu;
+struct dflash_hidden_gpu;
+
+#ifndef LLAMA_DFLASH_MAX_SLOTS
+#  define LLAMA_DFLASH_MAX_SLOTS 8
+#endif
+
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
@@ -43,12 +51,21 @@ struct llama_cparams {
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;
+    bool eagle3_extract_enabled;  // enable layer extraction for EAGLE3 speculative decoding
+    bool dflash_extract_enabled;  // enable layer extraction for DFlash speculative decoding
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;
+
+    // GPU-resident tape for DeltaNet rollback (graph writes directly, no eval callback sync).
+    // Per-seq tape pointers for multi-seq verify batching.
+    // tape_gpu_seqs[s] = tape for ubatch seq index s (0..tape_gpu_n_seqs-1).
+    // Populated by the decode loop before each process_ubatch().
+    dflash_tape_gpu * tape_gpu_seqs[LLAMA_DFLASH_MAX_SLOTS] = {};
+    int tape_gpu_n_seqs = 0;
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;

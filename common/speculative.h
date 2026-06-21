@@ -46,6 +46,8 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    float target_temp = 0.0f; // target model sampling temperature (0 = greedy, >0 = sampled)
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
